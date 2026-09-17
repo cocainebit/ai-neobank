@@ -440,7 +440,7 @@ export class PostgresJobQueue {
         const locked = await tx<{ status: string }[]>`select status from intents where id = ${intentId} for update`;
         if (locked[0]?.status !== "received") return;
         const simulationHash = await this.hash(tx, ["simulation-v1", intentId, row.network, row.amountBaseUnits, row.destination, evidence.feeBaseUnits, evidence.sourceBalanceBaseUnits]);
-        await tx`update intents set policy_version_id = ${policyResult?.versionId ?? null}, policy_decision = ${tx.json({ outcome: "approval_required", reasons: [...decision.reasons, `${row.governance} treasury: owners approve on chain`], spentTodayBaseUnits: spent, simulation: evidence, simulationHash, minApprovals: requiredApprovals } as never)} where id = ${intentId}`;
+        await tx`update intents set policy_version_id = ${policyResult?.versionId ?? null}, policy_decision = ${tx.json({ outcome: "approval_required", reasons: [...decision.reasons, row.governance === "safe" ? "Safe treasury: owners approve on chain" : "Squads vault: voting members approve on chain"], spentTodayBaseUnits: spent, simulation: evidence, simulationHash, minApprovals: requiredApprovals } as never)} where id = ${intentId}`;
         await this.transition(tx, intentId, row.organizationId, row.version, "received", "policy_evaluated", "intent.policy_evaluated", { governance: row.governance, requiredApprovals });
         await tx`
           insert into outbox_events (organization_id, topic, aggregate_type, aggregate_id, payload)

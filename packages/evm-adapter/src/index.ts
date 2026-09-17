@@ -38,6 +38,18 @@ export interface EvmAdapterOptions {
 
 const transferEvent = parseAbiItem("event Transfer(address indexed from, address indexed to, uint256 value)");
 
+/**
+ * A reason a person can read. viem's messages carry the call, the ABI and a docs
+ * link; the first line and the revert reason are what an approver needs.
+ */
+function simulationReason(error: unknown): string {
+  if (!(error instanceof Error)) return "Unknown simulation error";
+  const viemError = error as Error & { shortMessage?: string; details?: string; metaMessages?: string[] };
+  const revert = viemError.details?.replace(/^execution reverted:?\s*/i, "").trim();
+  const short = viemError.shortMessage ?? error.message.split("\n")[0] ?? "Simulation failed";
+  return revert ? `${short.replace(/\.$/, "")}: ${revert}` : short;
+}
+
 export class EvmAdapter implements ChainAdapter {
   readonly family = "evm" as const;
   readonly network: `eip155:${number}`;
@@ -115,7 +127,7 @@ export class EvmAdapter implements ChainAdapter {
       ]);
       return { ok: true, feeBaseUnits: gas * fees.maxFeePerGas };
     } catch (error) {
-      return { ok: false, feeBaseUnits: 0n, error: error instanceof Error ? error.message : "Unknown simulation error" };
+      return { ok: false, feeBaseUnits: 0n, error: simulationReason(error) };
     }
   }
 
@@ -146,7 +158,7 @@ export class EvmAdapter implements ChainAdapter {
       ]);
       return { ok: true, feeBaseUnits: gas * fees.maxFeePerGas };
     } catch (error) {
-      return { ok: false, feeBaseUnits: 0n, error: error instanceof Error ? error.message : "Unknown simulation error" };
+      return { ok: false, feeBaseUnits: 0n, error: simulationReason(error) };
     }
   }
 

@@ -1,10 +1,10 @@
 "use client";
 
 import { useMemo, useState } from "react";
-import { api, invalidate } from "../lib/api";
+import { api, invalidate, useApi } from "../lib/api";
 import { useAssets, useBeneficiaries, useTreasuries } from "../lib/data";
-import { networkLabel, parseUnits } from "../lib/format";
-import type { Intent } from "../lib/types";
+import { displayUnits, networkLabel, parseUnits } from "../lib/format";
+import type { Balance, Intent } from "../lib/types";
 import { Field, Modal, Notice, useAction } from "./ui";
 
 export function NewPayment({ onClose, onCreated, defaultTreasuryId }: { onClose(): void; onCreated?(intent: Intent): void; defaultTreasuryId?: string }) {
@@ -18,7 +18,11 @@ export function NewPayment({ onClose, onCreated, defaultTreasuryId }: { onClose(
   const networkAssets = useMemo(() => (assets.data ?? []).filter((asset) => asset.network === treasury?.network), [assets.data, treasury?.network]);
   const payees = (beneficiaries.data ?? []).filter((beneficiary) => beneficiary.status === "active" && beneficiary.network === treasury?.network);
   const [assetId, setAssetId] = useState("");
-  const asset = networkAssets.find((candidate) => candidate.id === assetId) ?? networkAssets[0];
+  // Default to what this treasury actually holds, so the form does not open on an empty asset.
+  const balances = useApi<{ balances: Balance[] }>(treasury ? `/v1/treasuries/${treasury.id}/balances` : null);
+  const held = useMemo(() => [...(balances.data?.balances ?? [])].filter((balance) => BigInt(balance.balanceBaseUnits ?? "0") > 0n).sort((a, b) => (BigInt(b.balanceBaseUnits ?? "0") > BigInt(a.balanceBaseUnits ?? "0") ? 1 : -1)), [balances.data]);
+  const fallback = networkAssets.find((candidate) => candidate.id === held[0]?.assetId) ?? networkAssets.find((candidate) => candidate.kind === "native") ?? networkAssets[0];
+  const asset = networkAssets.find((candidate) => candidate.id === assetId) ?? fallback;
   const [recipient, setRecipient] = useState<"beneficiary" | "address">("beneficiary");
   const [beneficiaryId, setBeneficiaryId] = useState("");
   const [destination, setDestination] = useState("");
@@ -74,7 +78,10 @@ export function NewPayment({ onClose, onCreated, defaultTreasuryId }: { onClose(
           </Field>
           <Field label="Asset">
             <select className="select" value={asset?.id ?? ""} onChange={(event) => setAssetId(event.target.value)}>
-              {networkAssets.map((candidate) => <option key={candidate.id} value={candidate.id}>{candidate.symbol}</option>)}
+              {networkAssets.map((candidate) => {
+                const balance = held.find((entry) => entry.assetId === candidate.id);
+                return <option key={candidate.id} value={candidate.id}>{candidate.symbol}{balance ? ` · ${displayUnits(balance.balanceBaseUnits ?? "0", balance.decimals)} available` : ""}</option>;
+              })}
             </select>
           </Field>
           <Field label="Purpose" className="span-2" hint="Shown to approvers and kept in the audit trail.">

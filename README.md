@@ -73,13 +73,23 @@ real simulation, and human approval decide what gets signed.
   executor can be rotated: Safe swaps immediately; Squads goes through an
   on-chain config proposal the members approve.
 
+- A web console (`apps/web`, Next.js) on the real API: wallet sign-in, treasury
+  creation (Safe deployment, Squads vault, development account), payments with
+  wallet approval, invoices with a public payment page (QR, wallet payment, and
+  the x402 endpoint), receipts and allocation, recurring payments, statements
+  with CSV, agents and API keys, policies, beneficiaries, members, an asset
+  registry, and the activity log. Development wallets in the browser
+  (`NEXT_PUBLIC_DEV_WALLET=1`) sign on local chains, so the whole product can be
+  driven end to end without a browser extension.
+
 ## Not yet
 
-A frontend on the real API, devnet runs, CI. KMS signing covers EVM keys;
+Devnet runs and CI. KMS signing covers EVM keys;
 Solana signers use KMS-wrapped envelopes. The KMS integration is verified
 against the AWS SDK's own command objects and an in-process KMS stand-in,
 not yet against a live AWS account. x402 from Safe or Squads treasuries is not
-supported yet. The web app in `apps/web` is still the earlier fixture prototype.
+supported yet. An EVM invoice must be in a token: a native transfer into a Safe
+cannot be attributed to an invoice.
 
 ## Run it locally
 
@@ -96,14 +106,24 @@ pnpm dev:api             # http://127.0.0.1:8720
 pnpm dev:worker
 ```
 
-Checks: `pnpm typecheck`, `pnpm test` (unit), `pnpm test:integration` (builds,
+Or run the whole stack (API, worker, and console on http://localhost:8721)
+against a `relay_dev` database, with development wallets enabled:
+
+```sh
+scripts/localnet.sh up   # also deploys Safe 1.4.1 singletons and a test token to Anvil
+# write .local/dev.env (see .env.example; it must set SIGNER_KEYRING)
+scripts/dev.sh up        # scripts/dev.sh logs | down
+```
+
+Checks: `pnpm typecheck`, `pnpm test` (unit), `pnpm --filter @ai-neobank/web
+test:e2e` (Playwright against the running stack), `pnpm test:integration` (builds,
 migrates, then runs database, EVM, Solana, worker, API, and Safe suites against
 the local chains). `pnpm localnet:down` stops the services by recorded PID.
 
 ## Layout
 
 `apps/api` (Fastify HTTP API), `apps/worker` (durable jobs: evaluate, expire,
-execute, confirm), `apps/web` (Next.js prototype), `packages/auth` (sign-in and
+execute, confirm), `apps/web` (Next.js console), `packages/auth` (sign-in and
 key material), `packages/database` (PostgreSQL store, migrations, job queue,
 ledger), `packages/domain` (schemas), `packages/policy` (pure policy engine),
 `packages/chain-core` (adapter interfaces), `packages/evm-adapter`,

@@ -39,6 +39,7 @@ export function Shell({ children }: { children: ReactNode }) {
   const approvals = useApi<Intent[]>("/v1/intents?status=approval_required", { refreshMs: 10_000 });
   const health = useApi<Health>("/health", { refreshMs: 30_000, raw: true });
   const [switcherOpen, setSwitcherOpen] = useState(false);
+  const [navOpen, setNavOpen] = useState(false);
   const pending = approvals.data?.length ?? 0;
   const section = pathname === "/" ? "/" : `/${pathname.split("/")[1]}`;
   const others = session.memberships.filter((membership) => membership.organizationId !== session.organization.id);
@@ -66,8 +67,13 @@ export function Shell({ children }: { children: ReactNode }) {
 
   return (
     <div className="shell">
-      <aside className="sidebar">
-        <div className="brand"><span className="brand-mark"><Icons.Logo /></span>Relay</div>
+      <aside className={`sidebar ${navOpen ? "open" : ""}`} onClick={(event) => { if ((event.target as HTMLElement).closest("a")) setNavOpen(false); }}>
+        <div className="brand">
+          <span className="brand-mark"><Icons.Logo /></span>Relay
+          <button className="nav-toggle" aria-expanded={navOpen} aria-label={navOpen ? "Hide navigation" : "Show navigation"} onClick={() => setNavOpen((open) => !open)}>
+            {navOpen ? <Icons.Close /> : <Icons.Menu />}
+          </button>
+        </div>
         <div style={{ position: "relative" }}>
           <button className="org-card" onClick={() => setSwitcherOpen((open) => !open)} aria-expanded={switcherOpen} aria-label="Switch organization">
             <span className="org-card-top">

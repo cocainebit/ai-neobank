@@ -44,5 +44,6 @@ export const Icons = {
   Clock: (props: IconProps) => <Icon {...props}><circle cx="12" cy="12" r="9" /><path d="M12 7v5l3 2" /></Icon>,
   Ethereum: (props: IconProps) => <Icon {...props}><path d="m12 2 7 10-7 4-7-4z" /><path d="m5 13.5 7 8.5 7-8.5-7 4z" /></Icon>,
   Solana: (props: IconProps) => <Icon {...props}><path d="M6 6h14l-2 3H4zM4 10.5h14l2 3H6zM6 15h14l-2 3H4z" /></Icon>,
+  Menu: (props: IconProps) => <Icon {...props}><path d="M4 7h16M4 12h16M4 17h16" /></Icon>,
   Link: (props: IconProps) => <Icon {...props}><path d="M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1" /></Icon>
 };

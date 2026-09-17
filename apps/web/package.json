@@ -7,7 +7,7 @@
     "dev": "next dev -p 8721",
     "start": "next start -p 8721",
     "test": "vitest run --passWithNoTests --exclude 'e2e/**'",
-    "test:e2e": "playwright test",
+    "test:e2e": "RUN_WEB_E2E=1 playwright test",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

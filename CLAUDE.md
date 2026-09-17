@@ -11,7 +11,7 @@ Codex 2026-09-16/17, taken over by Claude 2026-09-17. Status report with evidenc
 
 | instance | writes | mid-way through |
 |---|---|---|
-| achi-b6 (Claude, takeover) | everything under this repo | **done:** wallet auth, agent keys, policy/freeze/quorum on the durable path, sign-before-broadcast recovery, real finality, fee ledger, ERC-20/SPL. Safe + Squads on the intent path (executor never votes), x402 v2 from direct treasuries, invoices/beneficiaries/recurring/statements with a chain indexer and reconciliation, KMS custody and key/executor rotation. Web console on the real API (every page, public pay page, dev wallets), verified in headless Chrome. Failure-recovery drills, Solana devnet settlement, CI workflow (never executed: no remote). **next:** Base Sepolia once a key is funded, Squads and x402 on devnet |
+| achi-b6 (Claude, takeover) | everything under this repo | **done:** wallet auth, agent keys, policy/freeze/quorum on the durable path, sign-before-broadcast recovery, real finality, fee ledger, ERC-20/SPL. Safe + Squads on the intent path (executor never votes), x402 v2 from direct treasuries, invoices/beneficiaries/recurring/statements with a chain indexer and reconciliation, KMS custody and key/executor rotation. Web console on the real API (every page, public pay page, dev wallets), verified in headless Chrome. Failure-recovery drills, Solana devnet settlement, CI workflow (never executed: no remote). Squads and x402 also settled on Solana devnet; browser-wallet path (foreign EIP-1193 provider) verified. **next:** Base Sepolia once a key is funded, then x402 from a Safe (needs Safe message signing) |
 
 ## Ports (this repo's block is 8720-8755)
 

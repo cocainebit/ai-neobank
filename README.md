@@ -89,16 +89,21 @@ real simulation, and human approval decide what gets signed.
   expiring unsigned. A 0.01 SOL payment has settled on Solana devnet through the
   whole pipeline at `finalized` commitment.
 
+  Squads vaults and x402 purchases have settled on Solana devnet too, against the
+  real Squads program and a facilitator.
+
 ## Not yet
 
 Base Sepolia (the preflight is green but its faucets are gated, so the transfer
-test skips until a funded key is configured), Squads and x402 on devnet, and CI
-that has actually run: `.github/workflows/ci.yml` exists but this repository has
+test skips until a funded key is configured) and CI that has actually run: `.github/workflows/ci.yml` exists but this repository has
 no remote yet. KMS signing covers EVM keys;
 Solana signers use KMS-wrapped envelopes. The KMS integration is verified
 against the AWS SDK's own command objects and an in-process KMS stand-in,
 not yet against a live AWS account. x402 from Safe or Squads treasuries is not
-supported yet. An EVM invoice must be in a token: a native transfer into a Safe
+supported: the `exact` scheme needs a signature from the payer itself, so a
+Squads vault (a program address that cannot sign) is out of reach entirely, and
+a Safe would need Relay to collect owner signatures over an EIP-712 Safe message
+and a token whose `transferWithAuthorization` accepts ERC-1271 signatures. An EVM invoice must be in a token: a native transfer into a Safe
 cannot be attributed to an invoice.
 
 ## Run it locally

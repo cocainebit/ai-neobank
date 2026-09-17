@@ -223,7 +223,12 @@ export function isAgentToken(token: string): boolean {
 
 export function parseAgentToken(token: string): { keyId: string; secret: string } | null {
   if (!isAgentToken(token)) return null;
-  const [keyId, secret] = token.slice(agentKeyPrefix.length).split("_");
-  if (!keyId || !secret) return null;
+  // The key id is hex; the secret is base64url and may itself contain "_", so split only at the first one.
+  const rest = token.slice(agentKeyPrefix.length);
+  const separator = rest.indexOf("_");
+  if (separator <= 0) return null;
+  const keyId = rest.slice(0, separator);
+  const secret = rest.slice(separator + 1);
+  if (!/^[0-9a-f]+$/.test(keyId) || !secret) return null;
   return { keyId, secret };
 }

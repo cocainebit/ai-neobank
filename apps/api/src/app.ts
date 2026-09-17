@@ -23,6 +23,7 @@ import { EvmAdapter } from "@ai-neobank/evm-adapter";
 import { SolanaAdapter } from "@ai-neobank/solana-adapter";
 import { SafeGovernanceAdapter, recoverSafeSigner, safeTypedDataJson, type CompiledSafeTransaction, type SafeContractAddresses } from "@ai-neobank/safe-adapter";
 import { SquadsGovernanceAdapter } from "@ai-neobank/squads-adapter";
+import { X402PaymentClient, X402QuoteError, solanaWireNetwork } from "@ai-neobank/x402-adapter";
 import type { ResolvedAsset } from "@ai-neobank/chain-core";
 import { PublicKey, TransactionMessage, VersionedTransaction } from "@solana/web3.js";
 import { z } from "zod";
@@ -38,7 +39,7 @@ export interface AppOptions {
   allowSoftwareSigners?: boolean;
   chains?: {
     evm?: { network: `eip155:${number}`; chainId: number; rpcUrl: string; confirmations?: number; safeContracts?: SafeContractAddresses };
-    solana?: { network: `solana:${string}`; rpcUrl: string; finality?: "confirmed" | "finalized" };
+    solana?: { network: `solana:${string}`; rpcUrl: string; finality?: "confirmed" | "finalized"; x402Network?: string };
   };
   logger?: boolean;
 }
@@ -114,6 +115,7 @@ const decisionSchema = z.object({
   signature: z.string().min(16).max(8192).optional()
 });
 const onChainVoteSchema = z.object({ transactionSignature: z.string().min(32).max(128).optional() });
+const x402QuoteSchema = z.object({ url: z.string().url(), method: z.enum(["GET", "POST"]).default("GET"), treasuryAccountId: uuid, assetId: z.string().min(1), maxAmountBaseUnits: z.string().regex(/^\d+$/) });
 const evaluateSchema = z.object({ intent: paymentIntentSchema, policy: spendingPolicySchema, spentTodayBaseUnits: z.string().regex(/^\d+$/) });
 
 function invalid(reply: FastifyReply, details: unknown) {
@@ -132,6 +134,16 @@ export function buildApp(options: AppOptions) {
 
   const evmAdapter = options.chains?.evm ? new EvmAdapter(options.chains.evm) : null;
   const solanaAdapter = options.chains?.solana ? new SolanaAdapter(options.chains.solana) : null;
+  let x402Cache: X402PaymentClient | null = null;
+  const x402 = async () => {
+    if (x402Cache) return x402Cache;
+    const solana = options.chains?.solana;
+    x402Cache = new X402PaymentClient({
+      ...(options.chains?.evm ? { evm: { network: options.chains.evm.network, chainId: options.chains.evm.chainId, rpcUrl: options.chains.evm.rpcUrl } } : {}),
+      ...(solana ? { solana: { network: solana.network, rpcUrl: solana.rpcUrl, wireNetwork: solana.x402Network ?? await solanaWireNetwork(solana.network, solana.rpcUrl) } } : {})
+    });
+    return x402Cache;
+  };
   const safeAdapter = options.chains?.evm ? new SafeGovernanceAdapter({ rpcUrl: options.chains.evm.rpcUrl, chainId: options.chains.evm.chainId, ...(options.chains.evm.safeContracts ? { contracts: options.chains.evm.safeContracts } : {}) }) : null;
   const squadsAdapter = solanaAdapter ? new SquadsGovernanceAdapter(solanaAdapter) : null;
   const adapterFor = (family: "evm" | "svm", network: string) => {
@@ -222,7 +234,7 @@ export function buildApp(options: AppOptions) {
         directExecution: "e2e_local",
         safe: safeAdapter ? "e2e_local" : "not_configured",
         squads: squadsAdapter ? "e2e_local" : "not_configured",
-        x402: "not_implemented",
+        x402: evmAdapter || solanaAdapter ? "e2e_local" : "not_configured",
         softwareSigners: options.allowSoftwareSigners && options.signerMasterKey ? "enabled_development_only" : "disabled"
       }
     });
@@ -599,7 +611,15 @@ export function buildApp(options: AppOptions) {
     const treasury = await store.getTreasury(organizationId, parsed.data.treasuryAccountId);
     if (!treasury) return reply.code(404).send({ error: "treasury_not_found" });
     let destination: string;
-    try { destination = canonicalAddress(treasury.chainFamily, parsed.data.destination); } catch { return invalid(reply, "Destination is not a valid address for the treasury's chain"); }
+    if (parsed.data.kind === "x402") {
+      let url: URL;
+      try { url = new URL(parsed.data.destination); } catch { return invalid(reply, "x402 destination must be a URL"); }
+      const local = ["localhost", "127.0.0.1"].includes(url.hostname);
+      if (url.protocol !== "https:" && !(url.protocol === "http:" && local && options.environment !== "production")) return invalid(reply, "x402 destination must be https");
+      destination = url.toString();
+    } else {
+      try { destination = canonicalAddress(treasury.chainFamily, parsed.data.destination); } catch { return invalid(reply, "Destination is not a valid address for the treasury's chain"); }
+    }
     const intent = paymentIntentSchema.safeParse({
       id: crypto.randomUUID(),
       idempotencyKey: parsed.data.idempotencyKey,
@@ -763,6 +783,24 @@ export function buildApp(options: AppOptions) {
     const networks = [...new Set(treasuries.map((treasury) => treasury.network))];
     const assets = (await Promise.all(networks.map((network) => store.listAssets(network)))).flat();
     return { data: { agent: agentRecord, treasuries: treasuries.filter((treasury) => treasury.status === "active"), policies: bound.map((policy) => ({ id: policy.id, name: policy.name, version: policy.latest.version, definition: policy.latest.definition })), assets } };
+  });
+
+  /** Dry-run quote so an agent can see the seller's terms before committing an intent. Nothing is signed. */
+  app.post("/v1/agent/x402/quote", async (request, reply) => {
+    const auth = agent(request, reply); if (!auth) return;
+    const body = x402QuoteSchema.safeParse(request.body);
+    if (!body.success) return invalid(reply, body.error.flatten());
+    const treasury = await store.getTreasury(auth.organizationId, body.data.treasuryAccountId);
+    if (!treasury) return reply.code(404).send({ error: "treasury_not_found" });
+    const asset = await store.getAsset(body.data.assetId);
+    if (!asset || asset.network !== treasury.network || asset.kind === "native") return reply.code(422).send({ error: "asset_not_payable_for_x402" });
+    try {
+      const quote = await (await x402()).quote({ url: body.data.url, method: body.data.method }, { chainFamily: treasury.chainFamily, network: treasury.network, assetAddress: asset.address ?? "", maxAmountBaseUnits: BigInt(body.data.maxAmountBaseUnits) });
+      return { data: { url: quote.url, method: quote.method, requirements: quote.requirements, resource: quote.resource, quoteHash: X402PaymentClient.quoteHash(quote), offered: quote.paymentRequired.accepts } };
+    } catch (error) {
+      if (error instanceof X402QuoteError) return reply.code(422).send({ error: `x402_${error.code}`, message: error.message });
+      throw error;
+    }
   });
 
   // Ledger, audit, operations

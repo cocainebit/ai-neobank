@@ -163,7 +163,8 @@ describe("API end to end", () => {
   testIf("health reports what is configured, not what is hoped", async () => {
     const health = await app!.inject({ method: "GET", url: "/health" });
     expect(health.statusCode).toBe(200);
-    expect(health.json().integrations.squads).toBe("not_implemented");
+    expect(health.json().integrations.squads).toBe("not_configured");
+    expect(health.json().integrations.safe).toBe("e2e_local");
     expect(health.json().integrations.evm).toContain("rpc_reachable");
     expect(health.json().integrations.solana).toBe("not_configured");
   });

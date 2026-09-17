@@ -61,6 +61,12 @@ describe("agent keys and tokens", () => {
     const key = generateAgentKey();
     expect(parseAgentToken(key.token)).toEqual({ keyId: key.keyId, secret: key.secret });
     expect(parseAgentToken("rl_sess_abc")).toBeNull();
+    // Secrets are base64url and can contain underscores; the whole secret must survive parsing.
+    expect(parseAgentToken("rl_agent_0a1b2c_ab_cd_ef")).toEqual({ keyId: "0a1b2c", secret: "ab_cd_ef" });
+    for (let index = 0; index < 200; index += 1) {
+      const generated = generateAgentKey();
+      expect(parseAgentToken(generated.token)).toEqual({ keyId: generated.keyId, secret: generated.secret });
+    }
     expect(hashToken(key.secret)).toBe(hashToken(key.secret));
     expect(hashToken(key.secret)).not.toBe(hashToken(generateAgentKey().secret));
   });

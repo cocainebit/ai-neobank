@@ -40,11 +40,21 @@ real simulation, and human approval decide what gets signed.
   builds for their wallets; the worker mirrors on-chain votes and executes once
   the program marks the proposal approved.
 
+- x402 (v2, `exact` scheme) machine payments from direct treasuries: an agent
+  submits an intent whose destination is the resource URL and whose amount is
+  the most it may pay; intake fetches the 402, selects the option on the
+  treasury's network and asset, rejects anything above the cap, and the quote
+  itself becomes the compiled hash the approver signs over. After approval the
+  worker signs the EIP-3009 authorization (EVM) or the payer-side transaction
+  (Solana), persists it, sends the paid request, and books the settlement the
+  seller returns. A retry re-sends the same payload, which the network can only
+  honour once. Agents can dry-run quotes with `POST /v1/agent/x402/quote`.
+
 ## Not yet
 
-x402, a frontend on the real API, invoicing/beneficiaries/recurring/statements,
-HSM/KMS signing, devnet runs, CI. The web app in `apps/web` is still the earlier
-fixture prototype.
+A frontend on the real API, invoicing/beneficiaries/recurring/statements,
+HSM/KMS signing, devnet runs, CI. x402 from Safe or Squads treasuries is not
+supported yet. The web app in `apps/web` is still the earlier fixture prototype.
 
 ## Run it locally
 
@@ -73,6 +83,7 @@ key material), `packages/database` (PostgreSQL store, migrations, job queue,
 ledger), `packages/domain` (schemas), `packages/policy` (pure policy engine),
 `packages/chain-core` (adapter interfaces), `packages/evm-adapter`,
 `packages/solana-adapter`, `packages/safe-adapter`, `packages/squads-adapter`,
+`packages/x402-adapter` (client plus a local facilitator and seller for tests),
 `packages/signer` (AES-256-GCM envelope for development keys).
 
 Design references: `docs/BACKEND-ARCHITECTURE.md`, `docs/THREAT-MODEL.md`,

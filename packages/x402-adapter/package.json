@@ -1,0 +1,36 @@
+{
+  "name": "@ai-neobank/x402-adapter",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": { "types": "./src/index.ts", "default": "./dist/index.js" },
+    "./testing": { "types": "./src/testing.ts", "default": "./dist/testing.js" }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run --passWithNoTests",
+    "test:integration": "RUN_X402_INTEGRATION=1 vitest run src/integration.test.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@ai-neobank/chain-core": "workspace:*",
+    "@ai-neobank/evm-adapter": "workspace:*",
+    "@ai-neobank/solana-adapter": "workspace:*",
+    "@solana/kit": "^8.3.0",
+    "@solana/web3.js": "^1.98.4",
+    "@x402/core": "2.26.0",
+    "@x402/evm": "2.26.0",
+    "@x402/fetch": "2.26.0",
+    "@x402/svm": "2.26.0",
+    "viem": "^2.37.3"
+  },
+  "devDependencies": {
+    "@solana/spl-token": "^0.4.14",
+    "@types/express": "^5.0.3",
+    "@types/node": "^22.18.1",
+    "@x402/express": "2.26.0",
+    "express": "^5.1.0",
+    "vitest": "^3.2.4"
+  }
+}

@@ -8,7 +8,8 @@ export default {
   resolve: {
     alias: [
       { find: /^@ai-neobank\/worker$/, replacement: `${root}apps/worker/src/worker.ts` },
-      { find: /^@ai-neobank\/([a-z-]+)$/, replacement: `${root}packages/$1/src/index.ts` }
+      { find: /^@ai-neobank\/x402-adapter\/testing$/, replacement: `${root}packages/x402-adapter/src/testing.ts` },
+      { find: /^@ai-neobank\/([a-z0-9-]+)$/, replacement: `${root}packages/$1/src/index.ts` }
     ]
   }
 };

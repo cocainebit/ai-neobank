@@ -56,6 +56,9 @@ export interface ExecutionContext {
   treasuryConfiguration: Record<string, unknown>;
   /** Off-chain owner signatures collected for a Safe transaction. */
   ownerSignatures: { signerAddress: string; signedPayload: string }[];
+  kind: "transfer" | "x402";
+  /** x402: the quote captured at intake. */
+  x402: Record<string, unknown> | null;
   execution: { id: string; status: string; transactionHash: string | null; signedPayload: string | null; nonce: string | null; validUntil: string | null } | null;
 }
 
@@ -112,9 +115,13 @@ export interface SimulationEvidence {
   feeBaseUnits: string;
   sourceBalanceBaseUnits: string;
   error?: string;
+  /** x402: the selected 402 requirements and resource, captured at intake as approval evidence. */
+  quote?: Record<string, unknown>;
+  /** x402: hash of the quote; replaces the field hash as the compiled hash the approver signs over. */
+  compiledHash?: string;
 }
 
-export type Simulator = (input: { chainFamily: "evm" | "svm"; network: string; governance: "safe" | "squads" | "direct"; treasuryConfiguration: Record<string, unknown>; from: string; to: string; asset: AssetShape; amountBaseUnits: string; intentId: string }) => Promise<SimulationEvidence>;
+export type Simulator = (input: { chainFamily: "evm" | "svm"; network: string; governance: "safe" | "squads" | "direct"; treasuryConfiguration: Record<string, unknown>; from: string; to: string; asset: AssetShape; amountBaseUnits: string; intentId: string; kind: "transfer" | "x402" }) => Promise<SimulationEvidence>;
 
 interface IntentRow {
   intentId: string;
@@ -296,6 +303,11 @@ export class PostgresJobQueue {
     if (row.treasuryNetwork !== row.network) return "Intent network does not match the treasury network";
     if (!row.assetKind || row.assetDecimals === null) return `Unknown asset ${row.assetId}`;
     if (row.assetNetwork !== row.network) return "Asset does not belong to the intent network";
+    if (row.kind === "x402") {
+      if (row.governance !== "direct") return "x402 payments are made from direct treasuries; governed treasuries are not supported for x402 yet";
+      if (row.assetKind === "native") return "x402 pays in tokens, not the native coin";
+      if (!/^https?:\/\//.test(row.destination)) return "x402 destination must be an http(s) resource URL";
+    }
     return null;
   }
 
@@ -334,7 +346,7 @@ export class PostgresJobQueue {
     }
     let evidence: SimulationEvidence = { ok: true, feeBaseUnits: "0", sourceBalanceBaseUnits: "unknown" };
     if (simulate) {
-      evidence = await simulate({ chainFamily: row.chainFamily, network: row.network, governance: row.governance, treasuryConfiguration: row.observedConfiguration ?? {}, from: row.from, to: row.destination, asset, amountBaseUnits: row.amountBaseUnits, intentId });
+      evidence = await simulate({ chainFamily: row.chainFamily, network: row.network, governance: row.governance, treasuryConfiguration: row.observedConfiguration ?? {}, from: row.from, to: row.destination, asset, amountBaseUnits: row.amountBaseUnits, intentId, kind: row.kind });
       if (!evidence.ok) {
         await this.reject(intentId, row, { outcome: "rejected", reasons: [`Simulation failed: ${evidence.error ?? "unknown"}`] }, policyResult?.versionId ?? null);
         return;
@@ -361,16 +373,18 @@ export class PostgresJobQueue {
     const reasons = decision.outcome === "auto_authorized" && !row.autonomousExecution
       ? [...decision.reasons, "Autonomous execution is disabled for this organization"]
       : decision.reasons;
+    const compiledHash = evidence.compiledHash ?? row.compiledHash;
     await this.sql.begin(async (tx) => {
       const locked = await tx<{ status: string; version: number }[]>`select status, version from intents where id = ${intentId} for update`;
       if (locked[0]?.status !== "received") return;
-      await tx`update intents set policy_version_id = ${policyResult?.versionId ?? null}, policy_decision = ${tx.json({ outcome: autonomous ? "auto_authorized" : "approval_required", reasons, spentTodayBaseUnits: spent, simulation: evidence } as never)} where id = ${intentId}`;
+      const { quote, ...simulation } = evidence;
+      await tx`update intents set policy_version_id = ${policyResult?.versionId ?? null}, policy_decision = ${tx.json({ outcome: autonomous ? "auto_authorized" : "approval_required", reasons, spentTodayBaseUnits: spent, simulation, ...(quote ? { x402: quote } : {}) } as never)} where id = ${intentId}`;
       const simulationHash = await this.hash(tx, ["simulation-v1", intentId, row.network, row.amountBaseUnits, row.destination, evidence.feeBaseUnits, evidence.sourceBalanceBaseUnits]);
       if (autonomous) {
         await this.transition(tx, intentId, row.organizationId, row.version, "received", "approved", "intent.auto_authorized", { reasons, requiredApprovals: 0 });
         await tx`
           insert into approval_requests (organization_id, intent_id, required_approvals, compiled_hash, simulation_hash, status, expires_at)
-          values (${row.organizationId}, ${intentId}, 1, ${row.compiledHash}, ${simulationHash}, 'approved', ${row.expiresAt})
+          values (${row.organizationId}, ${intentId}, 1, ${compiledHash}, ${simulationHash}, 'approved', ${row.expiresAt})
           on conflict (intent_id) do nothing
         `;
         await tx`
@@ -382,7 +396,7 @@ export class PostgresJobQueue {
       await this.transition(tx, intentId, row.organizationId, row.version, "received", "approval_required", "intent.approval_required", { reasons, requiredApprovals });
       await tx`
         insert into approval_requests (organization_id, intent_id, required_approvals, compiled_hash, simulation_hash, expires_at)
-        values (${row.organizationId}, ${intentId}, ${requiredApprovals}, ${row.compiledHash}, ${simulationHash}, ${row.expiresAt})
+        values (${row.organizationId}, ${intentId}, ${requiredApprovals}, ${compiledHash}, ${simulationHash}, ${row.expiresAt})
         on conflict (intent_id) do nothing
       `;
       await tx`
@@ -589,6 +603,7 @@ export class PostgresJobQueue {
       amountBaseUnits: row.amountBaseUnits, intentStatus: row.status, intentVersion: row.version,
       signerId: row.signerId, signerAddress: row.signerAddress, encryptedSecret: row.encryptedSecret, encryptionNonce: row.encryptionNonce, authTag: row.authTag, keyVersion: row.keyVersion,
       approvalCompiledHash: row.approvalCompiledHash, externalRef: row.externalRef, treasuryConfiguration: row.observedConfiguration ?? {}, ownerSignatures,
+      kind: row.kind, x402: (row.policyDecision as { x402?: Record<string, unknown> } | null)?.x402 ?? null,
       execution: row.executionId ? { id: row.executionId, status: row.executionStatus!, transactionHash: row.transactionHash, signedPayload: row.signedPayload, nonce: row.nonce, validUntil: row.validUntil } : null
     };
   }
@@ -617,10 +632,17 @@ export class PostgresJobQueue {
     `;
   }
 
-  async markSubmitted(intentId: string, executionId: string): Promise<void> {
+  /**
+   * The transaction is on its way. For x402 the settlement is learned from the
+   * seller's response, so the hash, payee, and paid amount arrive here rather
+   * than at signing time.
+   */
+  async markSubmitted(intentId: string, executionId: string, settlement?: { transactionHash: string; payTo: string; amountBaseUnits: string; observed?: Record<string, unknown> }): Promise<void> {
     await this.sql.begin(async (tx) => {
       const executions = await tx<{ transactionHash: string; network: string }[]>`
-        update executions set status = 'submitted', broadcast_at = coalesce(broadcast_at, now()), updated_at = now()
+        update executions set status = 'submitted', broadcast_at = coalesce(broadcast_at, now()), updated_at = now(),
+          transaction_hash = coalesce(${settlement?.transactionHash ?? null}, transaction_hash),
+          compiled_payload = compiled_payload || ${tx.json((settlement ? { payTo: settlement.payTo, settledAmountBaseUnits: settlement.amountBaseUnits, settlement: settlement.observed ?? {} } : {}) as never)}
         where id = ${executionId} and status in ('signed', 'submitted') returning transaction_hash as "transactionHash", network
       `;
       const execution = executions[0];
@@ -632,10 +654,11 @@ export class PostgresJobQueue {
       `;
       const intent = rows[0];
       if (!intent) throw new Error("Intent was not executing during submission");
-      await this.event(tx, intent.organizationId, intentId, "intent.submitted", { transactionHash: execution.transactionHash });
+      const amount = settlement?.amountBaseUnits ?? intent.amountBaseUnits;
+      await this.event(tx, intent.organizationId, intentId, "intent.submitted", { transactionHash: execution.transactionHash, ...(settlement ? { payTo: settlement.payTo, amountBaseUnits: amount } : {}) });
       await this.postLedger(tx, intent.organizationId, intentId, `${execution.network}:${execution.transactionHash}:submitted`, "Outbound transfer submitted", [
-        { treasuryId: intent.treasuryId, code: "pending_outbound", assetId: intent.assetId, direction: "debit", amount: intent.amountBaseUnits },
-        { treasuryId: intent.treasuryId, code: "treasury_asset", assetId: intent.assetId, direction: "credit", amount: intent.amountBaseUnits }
+        { treasuryId: intent.treasuryId, code: "pending_outbound", assetId: intent.assetId, direction: "debit", amount },
+        { treasuryId: intent.treasuryId, code: "treasury_asset", assetId: intent.assetId, direction: "credit", amount }
       ]);
       await tx`
         insert into outbox_events (organization_id, topic, aggregate_type, aggregate_id, payload)
@@ -684,9 +707,10 @@ export class PostgresJobQueue {
   async getConfirmationContext(intentId: string): Promise<ConfirmationContext> {
     const rows = await this.sql<ConfirmationContext[]>`
       select i.id::text as "intentId", i.organization_id::text as "organizationId",
-        i.treasury_account_id::text as "treasuryId", i.network, t.chain_family as "chainFamily", i.destination as "to",
+        i.treasury_account_id::text as "treasuryId", i.network, t.chain_family as "chainFamily",
+        coalesce(e.compiled_payload->>'payTo', i.destination) as "to",
         i.asset_id as "assetId", jsonb_build_object('id', a.id, 'kind', a.kind, 'address', a.address, 'decimals', a.decimals) as asset,
-        i.amount_base_units::text as "amountBaseUnits",
+        coalesce(e.compiled_payload->>'settledAmountBaseUnits', i.amount_base_units::text) as "amountBaseUnits",
         e.id::text as "executionId", e.transaction_hash as "transactionHash"
       from intents i join treasury_accounts t on t.id = i.treasury_account_id
       join executions e on e.intent_id = i.id

@@ -1,5 +1,9 @@
 import postgres, { type JSONValue, type Sql, type TransactionSql } from "postgres";
 
+type Db = Sql | TransactionSql;
+import { evaluatePaymentIntent } from "@ai-neobank/policy";
+import { policyDefinitionSchema, nativeAssetIds, type PaymentIntent, type PolicyDecision, type SpendingPolicy } from "@ai-neobank/domain";
+
 export interface JobRecord {
   id: string;
   organizationId: string | null;
@@ -7,6 +11,23 @@ export interface JobRecord {
   payload: Record<string, unknown>;
   attempts: number;
   maxAttempts: number;
+}
+
+/** A terminal outcome: the intent must be failed, not retried. */
+export class ExecutionRejected extends Error {
+  constructor(message: string) { super(message); this.name = "ExecutionRejected"; }
+}
+
+/** Not an error: check again later without counting toward the dead-letter limit. */
+export class Deferred extends Error {
+  constructor(message: string, readonly delaySeconds = 5) { super(message); this.name = "Deferred"; }
+}
+
+export interface AssetShape {
+  id: string;
+  kind: "native" | "erc20" | "spl";
+  address: string | null;
+  decimals: number;
 }
 
 export interface ExecutionContext {
@@ -19,15 +40,17 @@ export interface ExecutionContext {
   from: string;
   to: string;
   assetId: string;
+  asset: AssetShape;
   amountBaseUnits: string;
   intentStatus: string;
+  intentVersion: number;
   signerId: string;
-  signerStatus: string;
   encryptedSecret: string;
   encryptionNonce: string;
   authTag: string;
   keyVersion: number;
   approvalCompiledHash: string;
+  execution: { id: string; status: string; transactionHash: string | null; signedPayload: string | null; nonce: string | null; validUntil: string | null } | null;
 }
 
 export interface ConfirmationContext {
@@ -36,14 +59,76 @@ export interface ConfirmationContext {
   treasuryId: string;
   network: string;
   chainFamily: "evm" | "svm";
+  to: string;
   assetId: string;
+  asset: AssetShape;
   amountBaseUnits: string;
   executionId: string;
   transactionHash: string;
 }
 
+export interface SimulationEvidence {
+  ok: boolean;
+  feeBaseUnits: string;
+  sourceBalanceBaseUnits: string;
+  error?: string;
+}
+
+export type Simulator = (input: { chainFamily: "evm" | "svm"; network: string; from: string; to: string; asset: AssetShape; amountBaseUnits: string; intentId: string }) => Promise<SimulationEvidence>;
+
+interface IntentRow {
+  intentId: string;
+  organizationId: string;
+  treasuryId: string;
+  requesterId: string;
+  requesterType: string;
+  requesterStatus: string;
+  agentStatus: string | null;
+  organizationFrozen: boolean;
+  autonomousExecution: boolean;
+  treasuryStatus: string;
+  treasuryNetwork: string;
+  chainFamily: "evm" | "svm";
+  governance: "safe" | "squads" | "direct";
+  from: string;
+  idempotencyKey: string;
+  kind: "transfer" | "x402";
+  network: string;
+  assetId: string;
+  assetKind: "native" | "erc20" | "spl" | null;
+  assetAddress: string | null;
+  assetDecimals: number | null;
+  assetNetwork: string | null;
+  amountBaseUnits: string;
+  destination: string;
+  purpose: string;
+  status: string;
+  version: number;
+  expiresAt: string;
+  compiledHash: string;
+}
+
+const intentJoin = `
+  select i.id::text as "intentId", i.organization_id::text as "organizationId", i.treasury_account_id::text as "treasuryId",
+    i.requester_principal_id::text as "requesterId", rp.type as "requesterType", rp.status as "requesterStatus", ag.status as "agentStatus",
+    o.frozen as "organizationFrozen", o.autonomous_execution as "autonomousExecution",
+    t.status as "treasuryStatus", t.network as "treasuryNetwork", t.chain_family as "chainFamily", t.governance, t.address as "from",
+    i.idempotency_key as "idempotencyKey", i.kind, i.network, i.asset_id as "assetId",
+    a.kind as "assetKind", a.address as "assetAddress", a.decimals as "assetDecimals", a.network as "assetNetwork",
+    i.amount_base_units::text as "amountBaseUnits", i.destination, i.purpose, i.status, i.version, i.expires_at::text as "expiresAt",
+    encode(digest(concat_ws('|', i.id::text, i.network, i.asset_id, i.amount_base_units::text, i.destination, i.kind), 'sha256'), 'hex') as "compiledHash"
+  from intents i
+  join organizations o on o.id = i.organization_id
+  join treasury_accounts t on t.id = i.treasury_account_id
+  join principals rp on rp.id = i.requester_principal_id
+  left join agents ag on ag.principal_id = rp.id
+  left join assets a on a.id = i.asset_id
+`;
+
 export class PostgresJobQueue {
-  constructor(private readonly sql: Sql) {}
+  constructor(readonly sql: Sql) {}
+
+  // Outbox and job leasing
 
   async pumpOutbox(limit = 100): Promise<number> {
     return this.sql.begin(async (tx) => {
@@ -67,13 +152,14 @@ export class PostgresJobQueue {
     });
   }
 
-  async claim(workerId: string, leaseSeconds = 30): Promise<JobRecord | null> {
+  /** Leases the next ready job. A job left `running` by a crashed worker is re-leased once its lease lapses. */
+  async claim(workerId: string, leaseSeconds = 60): Promise<JobRecord | null> {
     return this.sql.begin(async (tx) => {
       const rows = await tx<JobRecord[]>`
         with candidate as (
           select id from jobs
-          where status in ('queued', 'retry') and run_at <= now()
-            and (leased_until is null or leased_until < now())
+          where (status in ('queued', 'retry') and run_at <= now())
+             or (status = 'running' and leased_until < now())
           order by run_at, created_at
           for update skip locked
           limit 1
@@ -87,6 +173,10 @@ export class PostgresJobQueue {
       `;
       return rows[0] ?? null;
     });
+  }
+
+  async heartbeat(jobId: string, leaseSeconds = 60): Promise<void> {
+    await this.sql`update jobs set leased_until = now() + (${leaseSeconds} * interval '1 second') where id = ${jobId} and status = 'running'`;
   }
 
   async complete(jobId: string): Promise<void> {
@@ -104,32 +194,155 @@ export class PostgresJobQueue {
     `;
   }
 
-  async evaluateIntent(intentId: string): Promise<void> {
-    await this.sql.begin(async (tx) => {
-      const rows = await tx<{ organizationId: string; status: string; version: number; expiresAt: string; compiledHash: string; simulationHash: string }[]>`
-        select organization_id::text as "organizationId", status, version, expires_at::text as "expiresAt",
-          encode(digest(concat_ws('|', id::text, network, asset_id, amount_base_units::text, destination, kind), 'sha256'), 'hex') as "compiledHash",
-          encode(digest(concat_ws('|', 'preflight-v1', id::text, network, amount_base_units::text, destination), 'sha256'), 'hex') as "simulationHash"
-        from intents where id = ${intentId} for update
-      `;
-      const intent = rows[0];
-      if (!intent) throw new Error("Intent not found");
-      if (intent.status !== "received") return;
-      if (new Date(intent.expiresAt) <= new Date()) {
-        await this.transition(tx, intentId, intent.organizationId, intent.version, "received", "expired", "intent.expired");
+  /** Re-queues without counting an attempt; for waiting on chain finality. */
+  async defer(job: JobRecord, delaySeconds: number, note: string): Promise<void> {
+    await this.sql`
+      update jobs set status = 'retry', leased_until = null, attempts = greatest(attempts - 1, 0),
+        run_at = now() + (${delaySeconds} * interval '1 second'), last_error = ${note.slice(0, 2000)}, updated_at = now()
+      where id = ${job.id}
+    `;
+  }
+
+  async listJobs(filter: { status?: string; limit?: number } = {}): Promise<(JobRecord & { status: string; lastError: string | null; runAt: string })[]> {
+    return this.sql<(JobRecord & { status: string; lastError: string | null; runAt: string })[]>`
+      select id::text, organization_id::text as "organizationId", type, payload, attempts, max_attempts as "maxAttempts", status, last_error as "lastError", run_at::text as "runAt"
+      from jobs where (${filter.status ?? null}::text is null or status = ${filter.status ?? null}) order by created_at desc limit ${filter.limit ?? 100}
+    `;
+  }
+
+  // Policy
+
+  private async loadPolicy(tx: Db, organizationId: string, requesterId: string, treasuryId: string): Promise<{ versionId: string; policy: SpendingPolicy } | null> {
+    const rows = await tx<{ id: string; version: number; policyId: string; definition: unknown }[]>`
+      select pv.id::text, pv.version, pv.policy_id::text as "policyId", pv.definition
+      from policy_bindings b
+      join policy_versions pv on pv.id = b.policy_version_id
+      join agents ag on ag.id = b.agent_id
+      where b.organization_id = ${organizationId} and ag.principal_id = ${requesterId} and b.treasury_account_id is null and pv.status = 'active'
+      union all
+      select pv.id::text, pv.version, pv.policy_id::text, pv.definition
+      from policy_bindings b
+      join policy_versions pv on pv.id = b.policy_version_id
+      where b.organization_id = ${organizationId} and b.treasury_account_id = ${treasuryId} and b.agent_id is null and pv.status = 'active'
+      limit 1
+    `;
+    const row = rows[0];
+    if (!row) return null;
+    const definition = policyDefinitionSchema.parse(row.definition);
+    return { versionId: row.id, policy: { ...definition, id: row.policyId, version: row.version } };
+  }
+
+  /** Base units of the same asset the requester has committed in the trailing 24 hours, excluding this intent. */
+  private async spentToday(tx: Db, organizationId: string, requesterId: string, assetId: string, excludeIntentId: string): Promise<string> {
+    const rows = await tx<{ spent: string }[]>`
+      select coalesce(sum(amount_base_units), 0)::text as spent from intents
+      where organization_id = ${organizationId} and requester_principal_id = ${requesterId} and asset_id = ${assetId} and id <> ${excludeIntentId}
+        and status in ('approval_required', 'auto_authorized', 'approved', 'executing', 'submitted', 'finalized', 'reconciled')
+        and created_at > now() - interval '24 hours'
+    `;
+    return rows[0]?.spent ?? "0";
+  }
+
+  private gate(row: IntentRow): string | null {
+    if (row.organizationFrozen) return "Organization is frozen";
+    if (row.treasuryStatus !== "active") return `Treasury is ${row.treasuryStatus}`;
+    if (row.requesterStatus !== "active") return `Requester is ${row.requesterStatus}`;
+    if (row.requesterType === "agent" && row.agentStatus !== "active") return `Agent is ${row.agentStatus ?? "unregistered"}`;
+    if (row.treasuryNetwork !== row.network) return "Intent network does not match the treasury network";
+    if (!row.assetKind || row.assetDecimals === null) return `Unknown asset ${row.assetId}`;
+    if (row.assetNetwork !== row.network) return "Asset does not belong to the intent network";
+    return null;
+  }
+
+  private intentOf(row: IntentRow): PaymentIntent {
+    return { id: row.intentId, idempotencyKey: row.idempotencyKey, organizationId: row.organizationId, treasuryAccountId: row.treasuryId, requesterId: row.requesterId, network: row.network, assetId: row.assetId, amountBaseUnits: row.amountBaseUnits, destination: row.destination, purpose: row.purpose, expiresAt: row.expiresAt, kind: row.kind };
+  }
+
+  /**
+   * Intake: gates, policy, and a real simulation against the chain before any
+   * approval request exists. The simulation runs outside the transaction; the
+   * transition re-checks the intent is still `received` under lock.
+   */
+  async evaluateIntent(intentId: string, simulate?: Simulator): Promise<void> {
+    const rows = await this.sql.unsafe<IntentRow[]>(`${intentJoin} where i.id = $1`, [intentId]);
+    const row = rows[0];
+    if (!row) throw new Error("Intent not found");
+    if (row.status !== "received") return;
+    if (new Date(row.expiresAt) <= new Date()) {
+      await this.sql.begin((tx) => this.transition(tx, intentId, row.organizationId, row.version, "received", "expired", "intent.expired"));
+      return;
+    }
+    const gate = this.gate(row);
+    if (gate) {
+      await this.reject(intentId, row, { outcome: "rejected", reasons: [gate] }, null);
+      return;
+    }
+    const asset: AssetShape = { id: row.assetId, kind: row.assetKind!, address: row.assetAddress, decimals: row.assetDecimals! };
+    const policyResult = await this.loadPolicy(this.sql, row.organizationId, row.requesterId, row.treasuryId);
+    const spent = await this.spentToday(this.sql, row.organizationId, row.requesterId, row.assetId, intentId);
+    const decision: PolicyDecision = policyResult
+      ? evaluatePaymentIntent(this.intentOf(row), policyResult.policy, { spentTodayBaseUnits: spent, now: new Date() })
+      : { outcome: "approval_required", reasons: ["No policy is bound to this agent or treasury; human approval is required"] };
+    if (decision.outcome === "rejected") {
+      await this.reject(intentId, row, decision, policyResult?.versionId ?? null);
+      return;
+    }
+    let evidence: SimulationEvidence = { ok: true, feeBaseUnits: "0", sourceBalanceBaseUnits: "unknown" };
+    if (simulate) {
+      evidence = await simulate({ chainFamily: row.chainFamily, network: row.network, from: row.from, to: row.destination, asset, amountBaseUnits: row.amountBaseUnits, intentId });
+      if (!evidence.ok) {
+        await this.reject(intentId, row, { outcome: "rejected", reasons: [`Simulation failed: ${evidence.error ?? "unknown"}`] }, policyResult?.versionId ?? null);
         return;
       }
-      await this.transition(tx, intentId, intent.organizationId, intent.version, "received", "approval_required", "intent.approval_required");
+    }
+    const requiredApprovals = policyResult?.policy.minApprovals ?? 1;
+    const autonomous = decision.outcome === "auto_authorized" && row.autonomousExecution;
+    const reasons = decision.outcome === "auto_authorized" && !row.autonomousExecution
+      ? [...decision.reasons, "Autonomous execution is disabled for this organization"]
+      : decision.reasons;
+    await this.sql.begin(async (tx) => {
+      const locked = await tx<{ status: string; version: number }[]>`select status, version from intents where id = ${intentId} for update`;
+      if (locked[0]?.status !== "received") return;
+      await tx`update intents set policy_version_id = ${policyResult?.versionId ?? null}, policy_decision = ${tx.json({ outcome: autonomous ? "auto_authorized" : "approval_required", reasons, spentTodayBaseUnits: spent, simulation: evidence } as never)} where id = ${intentId}`;
+      const simulationHash = await this.hash(tx, ["simulation-v1", intentId, row.network, row.amountBaseUnits, row.destination, evidence.feeBaseUnits, evidence.sourceBalanceBaseUnits]);
+      if (autonomous) {
+        await this.transition(tx, intentId, row.organizationId, row.version, "received", "approved", "intent.auto_authorized", { reasons, requiredApprovals: 0 });
+        await tx`
+          insert into approval_requests (organization_id, intent_id, required_approvals, compiled_hash, simulation_hash, status, expires_at)
+          values (${row.organizationId}, ${intentId}, 1, ${row.compiledHash}, ${simulationHash}, 'approved', ${row.expiresAt})
+          on conflict (intent_id) do nothing
+        `;
+        await tx`
+          insert into outbox_events (organization_id, topic, aggregate_type, aggregate_id, payload)
+          values (${row.organizationId}, 'transaction.execute', 'intent', ${intentId}, ${tx.json({ intentId })})
+        `;
+        return;
+      }
+      await this.transition(tx, intentId, row.organizationId, row.version, "received", "approval_required", "intent.approval_required", { reasons, requiredApprovals });
       await tx`
         insert into approval_requests (organization_id, intent_id, required_approvals, compiled_hash, simulation_hash, expires_at)
-        values (${intent.organizationId}, ${intentId}, 1, ${intent.compiledHash}, ${intent.simulationHash}, ${intent.expiresAt})
+        values (${row.organizationId}, ${intentId}, ${requiredApprovals}, ${row.compiledHash}, ${simulationHash}, ${row.expiresAt})
         on conflict (intent_id) do nothing
       `;
       await tx`
         insert into outbox_events (organization_id, topic, aggregate_type, aggregate_id, payload, available_at)
-        values (${intent.organizationId}, 'approval.expire', 'intent', ${intentId}, ${tx.json({ intentId })}, ${intent.expiresAt})
+        values (${row.organizationId}, 'approval.expire', 'intent', ${intentId}, ${tx.json({ intentId })}, ${row.expiresAt})
       `;
     });
+  }
+
+  private async reject(intentId: string, row: IntentRow, decision: PolicyDecision, policyVersionId: string | null): Promise<void> {
+    await this.sql.begin(async (tx) => {
+      const locked = await tx<{ status: string }[]>`select status from intents where id = ${intentId} for update`;
+      if (locked[0]?.status !== "received") return;
+      await tx`update intents set policy_version_id = ${policyVersionId}, policy_decision = ${tx.json(decision as never)}, failure_reason = ${decision.reasons.join("; ")} where id = ${intentId}`;
+      await this.transition(tx, intentId, row.organizationId, row.version, "received", "rejected", "intent.rejected", { reasons: decision.reasons });
+    });
+  }
+
+  private async hash(tx: Db, parts: string[]): Promise<string> {
+    const rows = await tx<{ hash: string }[]>`select encode(digest(${parts.join("|")}, 'sha256'), 'hex') as hash`;
+    return rows[0]!.hash;
   }
 
   async expireApproval(intentId: string): Promise<void> {
@@ -142,35 +355,65 @@ export class PostgresJobQueue {
       `;
       const state = rows[0];
       if (!state || state.status !== "approval_required" || state.requestStatus !== "pending") return;
-      if (new Date(state.expiresAt) > new Date()) throw new Error("Approval expiry job ran before expiry");
+      if (new Date(state.expiresAt) > new Date()) throw new Deferred("Approval expiry job ran before expiry", Math.ceil((new Date(state.expiresAt).getTime() - Date.now()) / 1000) + 1);
       await tx`update approval_requests set status = 'expired', updated_at = now() where intent_id = ${intentId}`;
       await this.transition(tx, intentId, state.organizationId, state.version, "approval_required", "expired", "intent.expired");
     });
   }
 
+  // Execution
+
+  /**
+   * Everything the worker needs to sign, re-checked at execution time: freezes,
+   * expiry, and the policy run again against current spend. Throws
+   * ExecutionRejected for anything that must fail the intent.
+   */
   async getExecutionContext(intentId: string): Promise<ExecutionContext> {
-    const rows = await this.sql<ExecutionContext[]>`
-      select i.id::text as "intentId", i.organization_id::text as "organizationId",
-        i.treasury_account_id::text as "treasuryId", i.network, t.chain_family as "chainFamily",
-        t.governance, t.address as "from", i.destination as "to", i.asset_id as "assetId",
-        i.amount_base_units::text as "amountBaseUnits", i.status as "intentStatus",
-        s.id::text as "signerId", s.status as "signerStatus", s.encrypted_secret as "encryptedSecret",
-        s.encryption_nonce as "encryptionNonce", s.auth_tag as "authTag", s.key_version as "keyVersion",
-        ar.compiled_hash as "approvalCompiledHash"
-      from intents i
-      join treasury_accounts t on t.id = i.treasury_account_id
-      join signers s on s.organization_id = i.organization_id and s.chain_family = t.chain_family
-        and lower(s.address) = lower(t.address)
-      join approval_requests ar on ar.intent_id = i.id and ar.status = 'approved'
-      where i.id = ${intentId}
-      order by s.created_at desc limit 1
-    `;
-    const context = rows[0];
-    if (!context) throw new Error("Execution context or matching signer not found");
-    if (context.intentStatus !== "approved") throw new Error(`Intent is ${context.intentStatus}, not approved`);
-    if (context.signerStatus !== "active") throw new Error("Signer is not active");
-    if (context.governance !== "direct") throw new Error(`Governance ${context.governance} requires its dedicated adapter`);
-    return context;
+    const explicit = await this.sql.unsafe<(IntentRow & {
+      signerId: string | null; signerStatus: string | null; encryptedSecret: string | null; encryptionNonce: string | null; authTag: string | null; keyVersion: number | null;
+      approvalStatus: string | null; approvalCompiledHash: string | null;
+      executionId: string | null; executionStatus: string | null; transactionHash: string | null; signedPayload: string | null; nonce: string | null; validUntil: string | null;
+    })[]>(`
+      select base.*, sg."signerId", sg."signerStatus", sg."encryptedSecret", sg."encryptionNonce", sg."authTag", sg."keyVersion",
+        ar.status as "approvalStatus", ar.compiled_hash as "approvalCompiledHash",
+        e.id::text as "executionId", e.status as "executionStatus", e.transaction_hash as "transactionHash", e.signed_payload as "signedPayload", e.nonce, e.valid_until as "validUntil"
+      from (${intentJoin} where i.id = $1) base
+      left join lateral (
+        select s.id::text as "signerId", s.status as "signerStatus", s.encrypted_secret as "encryptedSecret", s.encryption_nonce as "encryptionNonce", s.auth_tag as "authTag", s.key_version as "keyVersion"
+        from signers s where s.organization_id = base."organizationId"::uuid and s.chain_family = base."chainFamily" and lower(s.address) = lower(base."from") and s.custody = 'encrypted_software'
+        order by s.created_at desc limit 1
+      ) sg on true
+      left join approval_requests ar on ar.intent_id = base."intentId"::uuid
+      left join executions e on e.intent_id = base."intentId"::uuid
+    `, [intentId]);
+    const row = explicit[0];
+    if (!row) throw new Error("Intent not found");
+    if (!["approved", "executing"].includes(row.status)) throw new Error(`Intent is ${row.status}, not approved`);
+    if (row.approvalStatus !== "approved" || !row.approvalCompiledHash) throw new ExecutionRejected("No approved approval request");
+    if (row.status === "executing" && !row.executionId) throw new ExecutionRejected("Intent is executing without an execution record");
+    if (row.governance !== "direct") throw new Error(`Governance ${row.governance} requires its dedicated adapter`);
+    const gate = this.gate(row);
+    if (gate) throw new ExecutionRejected(gate);
+    if (!row.signerId || !row.encryptedSecret || !row.encryptionNonce || !row.authTag || row.keyVersion === null) throw new ExecutionRejected("No encrypted signer matches the treasury address");
+    if (row.signerStatus !== "active") throw new ExecutionRejected(`Signer is ${row.signerStatus}`);
+    if (row.status === "approved" && new Date(row.expiresAt) <= new Date()) throw new ExecutionRejected("Intent expired before execution");
+    if (row.status === "approved") {
+      // Policy runs again immediately before signing, against spend committed since approval.
+      const policyResult = await this.loadPolicy(this.sql, row.organizationId, row.requesterId, row.treasuryId);
+      if (policyResult) {
+        const spent = await this.spentToday(this.sql, row.organizationId, row.requesterId, row.assetId, intentId);
+        const decision = evaluatePaymentIntent(this.intentOf(row), policyResult.policy, { spentTodayBaseUnits: spent, now: new Date() });
+        if (decision.outcome === "rejected") throw new ExecutionRejected(`Policy rejected at execution: ${decision.reasons.join("; ")}`);
+      }
+    }
+    return {
+      intentId, organizationId: row.organizationId, treasuryId: row.treasuryId, network: row.network, chainFamily: row.chainFamily, governance: row.governance,
+      from: row.from, to: row.destination, assetId: row.assetId, asset: { id: row.assetId, kind: row.assetKind!, address: row.assetAddress, decimals: row.assetDecimals! },
+      amountBaseUnits: row.amountBaseUnits, intentStatus: row.status, intentVersion: row.version,
+      signerId: row.signerId, encryptedSecret: row.encryptedSecret, encryptionNonce: row.encryptionNonce, authTag: row.authTag, keyVersion: row.keyVersion,
+      approvalCompiledHash: row.approvalCompiledHash,
+      execution: row.executionId ? { id: row.executionId, status: row.executionStatus!, transactionHash: row.transactionHash, signedPayload: row.signedPayload, nonce: row.nonce, validUntil: row.validUntil } : null
+    };
   }
 
   async recordSimulation(context: ExecutionContext, feeBaseUnits: bigint, compiledPayload: Record<string, unknown>, compiledHash: string): Promise<string> {
@@ -182,23 +425,81 @@ export class PostgresJobQueue {
         on conflict (intent_id) do update set simulation = excluded.simulation, updated_at = now()
         returning id::text
       `;
-      await tx`update intents set status = 'executing', version = version + 1, updated_at = now() where id = ${context.intentId} and status = 'approved'`;
+      const moved = await tx`update intents set status = 'executing', version = version + 1, updated_at = now() where id = ${context.intentId} and status = 'approved'`;
+      if (moved.count > 0) await this.event(tx, context.organizationId, context.intentId, "intent.executing", { feeBaseUnits: feeBaseUnits.toString() });
       if (!rows[0]) throw new Error("Execution insert returned no row");
       return rows[0].id;
     });
   }
 
-  async markSubmitted(intentId: string, executionId: string, transactionHash: string): Promise<void> {
+  /** Persists the signed bytes and their hash before anything reaches the network. */
+  async markSigned(executionId: string, signed: { hash: string; raw: string; nonce: string; validUntil: string }): Promise<void> {
+    await this.sql`
+      update executions set status = 'signed', transaction_hash = ${signed.hash}, signed_payload = ${signed.raw}, nonce = ${signed.nonce}, valid_until = ${signed.validUntil}, updated_at = now()
+      where id = ${executionId} and status = 'simulated'
+    `;
+  }
+
+  async markSubmitted(intentId: string, executionId: string): Promise<void> {
     await this.sql.begin(async (tx) => {
-      await tx`update executions set status = 'submitted', transaction_hash = ${transactionHash}, updated_at = now() where id = ${executionId}`;
-      const rows = await tx<{ organizationId: string }[]>`
-        update intents set status = 'submitted', version = version + 1, updated_at = now()
-        where id = ${intentId} and status = 'executing' returning organization_id::text as "organizationId"
+      const executions = await tx<{ transactionHash: string; network: string }[]>`
+        update executions set status = 'submitted', broadcast_at = coalesce(broadcast_at, now()), updated_at = now()
+        where id = ${executionId} and status in ('signed', 'submitted') returning transaction_hash as "transactionHash", network
       `;
-      if (!rows[0]) throw new Error("Intent was not executing during submission");
+      const execution = executions[0];
+      if (!execution?.transactionHash) throw new Error("Execution has no signed transaction");
+      const rows = await tx<{ organizationId: string; treasuryId: string; assetId: string; amountBaseUnits: string }[]>`
+        update intents set status = 'submitted', version = version + 1, updated_at = now()
+        where id = ${intentId} and status = 'executing'
+        returning organization_id::text as "organizationId", treasury_account_id::text as "treasuryId", asset_id as "assetId", amount_base_units::text as "amountBaseUnits"
+      `;
+      const intent = rows[0];
+      if (!intent) throw new Error("Intent was not executing during submission");
+      await this.event(tx, intent.organizationId, intentId, "intent.submitted", { transactionHash: execution.transactionHash });
+      await this.postLedger(tx, intent.organizationId, intentId, `${execution.network}:${execution.transactionHash}:submitted`, "Outbound transfer submitted", [
+        { treasuryId: intent.treasuryId, code: "pending_outbound", assetId: intent.assetId, direction: "debit", amount: intent.amountBaseUnits },
+        { treasuryId: intent.treasuryId, code: "treasury_asset", assetId: intent.assetId, direction: "credit", amount: intent.amountBaseUnits }
+      ]);
       await tx`
         insert into outbox_events (organization_id, topic, aggregate_type, aggregate_id, payload)
-        values (${rows[0].organizationId}, 'transaction.confirm', 'intent', ${intentId}, ${tx.json({ intentId })})
+        values (${intent.organizationId}, 'transaction.confirm', 'intent', ${intentId}, ${tx.json({ intentId })})
+      `;
+    });
+  }
+
+  /** Terminal failure. Reverses the pending booking if the transfer had been submitted; books the fee if one was paid. */
+  async markFailed(intentId: string, reason: string, fee?: { feeBaseUnits: bigint; network: string; transactionHash: string }): Promise<void> {
+    await this.sql.begin(async (tx) => {
+      const rows = await tx<{ organizationId: string; treasuryId: string; assetId: string; amountBaseUnits: string; status: string; version: number; chainFamily: "evm" | "svm"; network: string }[]>`
+        select i.organization_id::text as "organizationId", i.treasury_account_id::text as "treasuryId", i.asset_id as "assetId", i.amount_base_units::text as "amountBaseUnits",
+          i.status, i.version, t.chain_family as "chainFamily", i.network
+        from intents i join treasury_accounts t on t.id = i.treasury_account_id where i.id = ${intentId} for update of i
+      `;
+      const intent = rows[0];
+      if (!intent) throw new Error("Intent not found");
+      if (["failed", "reconciled", "finalized", "rejected", "expired"].includes(intent.status)) return;
+      const executions = await tx<{ status: string; transactionHash: string | null; network: string }[]>`
+        update executions set status = 'failed', error = ${reason.slice(0, 2000)}, updated_at = now() where intent_id = ${intentId} returning status, transaction_hash as "transactionHash", network
+      `;
+      await tx`update intents set status = 'failed', failure_reason = ${reason.slice(0, 2000)}, version = version + 1, updated_at = now() where id = ${intentId}`;
+      await this.event(tx, intent.organizationId, intentId, "intent.failed", { from: intent.status, reason });
+      const execution = executions[0];
+      if (intent.status === "submitted" && execution?.transactionHash) {
+        await this.postLedger(tx, intent.organizationId, intentId, `${execution.network}:${execution.transactionHash}:reversal`, `Submitted transfer failed: ${reason.slice(0, 120)}`, [
+          { treasuryId: intent.treasuryId, code: "treasury_asset", assetId: intent.assetId, direction: "debit", amount: intent.amountBaseUnits },
+          { treasuryId: intent.treasuryId, code: "pending_outbound", assetId: intent.assetId, direction: "credit", amount: intent.amountBaseUnits }
+        ]);
+      }
+      if (fee && fee.feeBaseUnits > 0n) {
+        const nativeAsset = `${fee.network}/${nativeAssetIds[intent.chainFamily]}`;
+        await this.postLedger(tx, intent.organizationId, intentId, `${fee.network}:${fee.transactionHash}:fee`, "Network fee on failed transaction", [
+          { treasuryId: intent.treasuryId, code: "fee_expense", assetId: nativeAsset, direction: "debit", amount: fee.feeBaseUnits.toString() },
+          { treasuryId: intent.treasuryId, code: "treasury_asset", assetId: nativeAsset, direction: "credit", amount: fee.feeBaseUnits.toString() }
+        ]);
+      }
+      await tx`
+        insert into audit_events (organization_id, actor_principal_id, action, resource_type, resource_id, payload_hash, data)
+        values (${intent.organizationId}, null, 'intent.failed', 'intent', ${intentId}, encode(digest(${reason}, 'sha256'), 'hex'), ${tx.json({ reason, previousStatus: intent.status })})
       `;
     });
   }
@@ -206,71 +507,112 @@ export class PostgresJobQueue {
   async getConfirmationContext(intentId: string): Promise<ConfirmationContext> {
     const rows = await this.sql<ConfirmationContext[]>`
       select i.id::text as "intentId", i.organization_id::text as "organizationId",
-        i.treasury_account_id::text as "treasuryId", i.network, t.chain_family as "chainFamily",
-        i.asset_id as "assetId", i.amount_base_units::text as "amountBaseUnits",
+        i.treasury_account_id::text as "treasuryId", i.network, t.chain_family as "chainFamily", i.destination as "to",
+        i.asset_id as "assetId", jsonb_build_object('id', a.id, 'kind', a.kind, 'address', a.address, 'decimals', a.decimals) as asset,
+        i.amount_base_units::text as "amountBaseUnits",
         e.id::text as "executionId", e.transaction_hash as "transactionHash"
       from intents i join treasury_accounts t on t.id = i.treasury_account_id
       join executions e on e.intent_id = i.id
+      join assets a on a.id = i.asset_id
       where i.id = ${intentId} and i.status = 'submitted' and e.status = 'submitted'
     `;
     if (!rows[0]) throw new Error("Submitted execution not found");
     return rows[0];
   }
 
-  async markFinalized(context: ConfirmationContext, receipt: { blockHeight: bigint; feeBaseUnits: bigint }): Promise<void> {
-    await this.sql.begin(async (tx) => {
+  /**
+   * Finality reached. Settles the pending booking, books the fee, and marks the
+   * intent reconciled only when the chain shows the destination received the
+   * intended amount; otherwise it stays `finalized` with a recorded break.
+   */
+  async markFinalized(context: ConfirmationContext, receipt: { blockHeight: bigint; feeBaseUnits: bigint; confirmations: number; destinationDeltaBaseUnits?: bigint }): Promise<"reconciled" | "finalized"> {
+    return this.sql.begin(async (tx) => {
+      const delta = receipt.destinationDeltaBaseUnits;
+      const reconciled = delta !== undefined && delta === BigInt(context.amountBaseUnits);
+      const observed = { destinationDeltaBaseUnits: delta?.toString() ?? null, expectedBaseUnits: context.amountBaseUnits, reconciliation: reconciled ? "matched" : delta === undefined ? "unverifiable" : "break" };
       await tx`
         update executions set status = 'finalized', block_cursor = ${receipt.blockHeight.toString()},
-          fee_base_units = ${receipt.feeBaseUnits.toString()}, updated_at = now()
+          fee_base_units = ${receipt.feeBaseUnits.toString()}, confirmations = ${receipt.confirmations}, observed = ${tx.json(observed)}, updated_at = now()
         where id = ${context.executionId} and status = 'submitted'
       `;
-      await tx`update intents set status = 'finalized', version = version + 1, updated_at = now() where id = ${context.intentId} and status = 'submitted'`;
-      const treasuryAccounts = await tx<{ id: string }[]>`
-        insert into ledger_accounts (organization_id, treasury_account_id, code, name, asset_id)
-        values (${context.organizationId}, ${context.treasuryId}, 'treasury_asset', 'Treasury asset', ${context.assetId})
-        on conflict (organization_id, code, asset_id) do update set name = excluded.name returning id::text
-      `;
-      const expenseAccounts = await tx<{ id: string }[]>`
-        insert into ledger_accounts (organization_id, code, name, asset_id)
-        values (${context.organizationId}, 'settled_expense', 'Settled expense', ${context.assetId})
-        on conflict (organization_id, code, asset_id) do update set name = excluded.name returning id::text
-      `;
-      const ledgerTransactions = await tx<{ id: string }[]>`
-        insert into ledger_transactions (organization_id, intent_id, external_reference, description, effective_at)
-        values (${context.organizationId}, ${context.intentId}, ${`${context.network}:${context.transactionHash}`}, 'Finalized outbound transfer', now())
-        on conflict (organization_id, external_reference) do update set description = excluded.description returning id::text
-      `;
-      const transactionId = ledgerTransactions[0]?.id;
-      const treasuryAccountId = treasuryAccounts[0]?.id;
-      const expenseAccountId = expenseAccounts[0]?.id;
-      if (!transactionId || !treasuryAccountId || !expenseAccountId) throw new Error("Ledger account creation failed");
-      const existing = await tx<{ count: number }[]>`select count(*)::int as count from ledger_entries where transaction_id = ${transactionId}`;
-      if ((existing[0]?.count ?? 0) === 0) {
-        await tx`
-          insert into ledger_entries (transaction_id, account_id, direction, amount_base_units) values
-            (${transactionId}, ${expenseAccountId}, 'debit', ${context.amountBaseUnits}),
-            (${transactionId}, ${treasuryAccountId}, 'credit', ${context.amountBaseUnits})
-        `;
+      const moved = await tx`update intents set status = 'finalized', version = version + 1, updated_at = now() where id = ${context.intentId} and status = 'submitted'`;
+      if (moved.count === 0) return reconciled ? "reconciled" : "finalized";
+      await this.event(tx, context.organizationId, context.intentId, "intent.finalized", { blockHeight: receipt.blockHeight.toString(), confirmations: receipt.confirmations, feeBaseUnits: receipt.feeBaseUnits.toString() });
+      const reference = `${context.network}:${context.transactionHash}`;
+      await this.postLedger(tx, context.organizationId, context.intentId, `${reference}:finalized`, "Outbound transfer finalized", [
+        { treasuryId: context.treasuryId, code: "settled_expense", assetId: context.assetId, direction: "debit", amount: context.amountBaseUnits },
+        { treasuryId: context.treasuryId, code: "pending_outbound", assetId: context.assetId, direction: "credit", amount: context.amountBaseUnits }
+      ]);
+      if (receipt.feeBaseUnits > 0n) {
+        const nativeAsset = `${context.network}/${nativeAssetIds[context.chainFamily]}`;
+        await this.postLedger(tx, context.organizationId, context.intentId, `${reference}:fee`, "Network fee", [
+          { treasuryId: context.treasuryId, code: "fee_expense", assetId: nativeAsset, direction: "debit", amount: receipt.feeBaseUnits.toString() },
+          { treasuryId: context.treasuryId, code: "treasury_asset", assetId: nativeAsset, direction: "credit", amount: receipt.feeBaseUnits.toString() }
+        ]);
       }
-      await tx`update intents set status = 'reconciled', version = version + 1, updated_at = now() where id = ${context.intentId} and status = 'finalized'`;
+      if (reconciled) {
+        await tx`update intents set status = 'reconciled', version = version + 1, updated_at = now() where id = ${context.intentId} and status = 'finalized'`;
+        await this.event(tx, context.organizationId, context.intentId, "intent.reconciled", observed);
+        return "reconciled";
+      }
+      await this.event(tx, context.organizationId, context.intentId, "intent.reconciliation_break", observed);
+      await tx`
+        insert into audit_events (organization_id, actor_principal_id, action, resource_type, resource_id, payload_hash, data)
+        values (${context.organizationId}, null, 'reconciliation.break', 'intent', ${context.intentId}, encode(digest(${JSON.stringify(observed)}, 'sha256'), 'hex'), ${tx.json(observed)})
+      `;
+      return "finalized";
     });
   }
 
-  private async transition(tx: TransactionSql, intentId: string, organizationId: string, version: number, from: string, to: string, eventType: string) {
+  // Ledger helpers
+
+  private async account(tx: TransactionSql, organizationId: string, treasuryId: string, code: string, assetId: string): Promise<string> {
+    const names: Record<string, string> = { treasury_asset: "Treasury asset", pending_outbound: "Pending outbound", settled_expense: "Settled expense", fee_expense: "Network fees" };
+    const rows = await tx<{ id: string }[]>`
+      insert into ledger_accounts (organization_id, treasury_account_id, code, name, asset_id)
+      values (${organizationId}, ${treasuryId}, ${code}, ${names[code] ?? code}, ${assetId})
+      on conflict (organization_id, coalesce(treasury_account_id, '00000000-0000-0000-0000-000000000000'::uuid), code, asset_id) do update set name = excluded.name
+      returning id::text
+    `;
+    if (!rows[0]) throw new Error("Ledger account upsert failed");
+    return rows[0].id;
+  }
+
+  /** Posts a balanced set of entries once per external reference. */
+  private async postLedger(tx: TransactionSql, organizationId: string, intentId: string, reference: string, description: string, entries: { treasuryId: string; code: string; assetId: string; direction: "debit" | "credit"; amount: string }[]): Promise<boolean> {
+    const perAsset = new Map<string, bigint>();
+    for (const entry of entries) perAsset.set(entry.assetId, (perAsset.get(entry.assetId) ?? 0n) + (entry.direction === "debit" ? 1n : -1n) * BigInt(entry.amount));
+    for (const [assetId, net] of perAsset) if (net !== 0n) throw new Error(`Unbalanced ledger posting for ${assetId}`);
+    const rows = await tx<{ id: string }[]>`
+      insert into ledger_transactions (organization_id, intent_id, external_reference, description, effective_at)
+      values (${organizationId}, ${intentId}, ${reference}, ${description}, now())
+      on conflict (organization_id, external_reference) do nothing returning id::text
+    `;
+    const transactionId = rows[0]?.id;
+    if (!transactionId) return false;
+    for (const entry of entries) {
+      const accountId = await this.account(tx, organizationId, entry.treasuryId, entry.code, entry.assetId);
+      await tx`insert into ledger_entries (transaction_id, account_id, direction, amount_base_units) values (${transactionId}, ${accountId}, ${entry.direction}, ${entry.amount})`;
+    }
+    return true;
+  }
+
+  private async event(tx: TransactionSql, organizationId: string, intentId: string, eventType: string, data: Record<string, unknown>): Promise<void> {
+    const sequences = await tx<{ sequence: number }[]>`select coalesce(max(sequence), 0) + 1 as sequence from intent_events where intent_id = ${intentId}`;
+    await tx`
+      insert into intent_events (organization_id, intent_id, sequence, event_type, data)
+      values (${organizationId}, ${intentId}, ${sequences[0]?.sequence ?? 1}, ${eventType}, ${tx.json(data as never)})
+    `;
+  }
+
+  private async transition(tx: TransactionSql, intentId: string, organizationId: string, version: number, from: string, to: string, eventType: string, data: Record<string, unknown> = {}) {
     const updated = await tx<{ version: number }[]>`
       update intents set status = ${to}, version = version + 1, updated_at = now()
       where id = ${intentId} and status = ${from} and version = ${version}
       returning version
     `;
     if (!updated[0]) throw new Error(`Concurrent intent transition from ${from}`);
-    const sequences = await tx<{ sequence: number }[]>`
-      select coalesce(max(sequence), 0) + 1 as sequence from intent_events where intent_id = ${intentId}
-    `;
-    const sequence = sequences[0]?.sequence ?? 1;
-    await tx`
-      insert into intent_events (organization_id, intent_id, sequence, event_type, data)
-      values (${organizationId}, ${intentId}, ${sequence}, ${eventType}, ${tx.json({ from, to, version: updated[0].version })})
-    `;
+    await this.event(tx, organizationId, intentId, eventType, { ...data, from, to, version: updated[0].version });
   }
 
   async close(): Promise<void> { await this.sql.end(); }

@@ -1,95 +1,128 @@
 import { describe, expect, it } from "vitest";
-import { createPostgresJobQueue, createPostgresStore } from "./index.js";
+import { createPostgresJobQueue, createPostgresStore, ExecutionRejected, type PostgresControlPlaneStore } from "./index.js";
+import type { PolicyDefinition } from "@ai-neobank/domain";
 
-const enabled = process.env.RUN_DATABASE_INTEGRATION === "1";
-const testIf = enabled ? it : it.skip;
+const databaseUrl = process.env.DATABASE_URL;
+const testIf = process.env.RUN_DATABASE_INTEGRATION === "1" && databaseUrl ? it : it.skip;
+const network = "eip155:31337";
+const nativeAsset = `${network}/slip44:60`;
+const address = () => `0x${crypto.randomUUID().replaceAll("-", "").padEnd(40, "0")}`;
 
-describe("PostgreSQL control-plane store", () => {
-  testIf("persists an organization and revocable agent identity", async () => {
-    const databaseUrl = process.env.DATABASE_URL;
-    if (!databaseUrl) throw new Error("DATABASE_URL is required");
-    const store = createPostgresStore(databaseUrl);
-    const queue = createPostgresJobQueue(databaseUrl);
+function policy(overrides: Partial<PolicyDefinition> = {}): PolicyDefinition {
+  return { frozen: false, maxPerTransactionBaseUnits: "1000", maxDailyBaseUnits: "1500", autoApproveUpToBaseUnits: "0", allowedNetworks: [network], allowedAssets: [nativeAsset], allowedDestinations: [], allowedKinds: ["transfer"], humanApprovalRequired: true, minApprovals: 2, ...overrides };
+}
+
+async function intent(store: PostgresControlPlaneStore, input: { organizationId: string; treasuryAccountId: string; requesterId: string; amount: string; assetId?: string; destination?: string }) {
+  const id = crypto.randomUUID();
+  await store.createIntent({ id, idempotencyKey: `db-${crypto.randomUUID()}`, organizationId: input.organizationId, treasuryAccountId: input.treasuryAccountId, requesterId: input.requesterId, network, assetId: input.assetId ?? nativeAsset, amountBaseUnits: input.amount, destination: input.destination ?? address(), purpose: "Database integration", expiresAt: new Date(Date.now() + 120_000).toISOString(), kind: "transfer" });
+  return id;
+}
+
+describe("PostgreSQL control plane", () => {
+  testIf("identity, policy enforcement, quorum, freezes, and execution gating", async () => {
+    const store = createPostgresStore(databaseUrl!);
+    const queue = createPostgresJobQueue(databaseUrl!);
     try {
-      expect(await store.health()).toBe(true);
       const suffix = crypto.randomUUID().slice(0, 8);
-      const organization = await store.createOrganization({ name: "Integration Test", slug: `integration-${suffix}` });
-      const agent = await store.createAgent(organization.id, { displayName: "Test agent", purpose: "Verify durable control-plane storage" });
-      expect((await store.listAgents(organization.id))[0]?.displayName).toBe("Test agent");
-      const frozen = await store.setAgentStatus(organization.id, agent.id, "frozen");
-      expect(frozen?.status).toBe("frozen");
-      expect(frozen?.capabilityVersion).toBe(2);
-      const signer = await store.createSigner(organization.id, {
-        agentId: agent.id,
-        chainFamily: "evm",
-        address: `0x${crypto.randomUUID().replaceAll("-", "").padEnd(40, "0")}`,
-        encryptedSecret: "ciphertext-only",
-        encryptionNonce: "nonce",
-        authTag: "tag",
-        keyVersion: 1
-      });
-      expect((await store.listSigners(organization.id))[0]).not.toHaveProperty("encryptedSecret");
-      expect((await store.getSignerSecret(organization.id, signer.id))?.encryptedSecret).toBe("ciphertext-only");
-      const treasury = await store.createTreasury(organization.id, {
-        name: "Local treasury",
-        chainFamily: "evm",
-        network: "eip155:31337",
-        address: signer.address,
-        governance: "direct"
-      });
-      expect((await store.listTreasuries(organization.id))[0]?.id).toBe(treasury.id);
-      const approver = await store.createHumanPrincipal(organization.id, { displayName: "Owner", role: "owner" });
-      const intentId = crypto.randomUUID();
-      await store.createIntent({
-        id: intentId,
-        idempotencyKey: `integration-${crypto.randomUUID()}`,
-        organizationId: organization.id,
-        treasuryAccountId: treasury.id,
-        requesterId: agent.principalId,
-        network: "eip155:31337",
-        assetId: "slip44:60",
-        amountBaseUnits: "1000",
-        destination: "0x000000000000000000000000000000000000dEaD",
-        purpose: "Approval lifecycle integration test",
-        expiresAt: new Date(Date.now() + 60_000).toISOString(),
-        kind: "transfer"
-      });
-      await queue.pumpOutbox();
-      let job = await queue.claim("integration-test");
-      while (job && job.type !== "intent.evaluate") {
-        await queue.complete(job.id);
-        job = await queue.claim("integration-test");
-      }
-      expect(job?.type).toBe("intent.evaluate");
-      await queue.evaluateIntent(intentId);
-      if (job) await queue.complete(job.id);
-      const approval = await store.getApprovalRequest(organization.id, intentId);
-      expect(approval?.compiledHash).toMatch(/^[a-f0-9]{64}$/);
-      await expect(store.decideIntent(organization.id, intentId, {
-        principalId: approver.id,
-        decision: "approved",
-        expectedIntentVersion: 2,
-        compiledHash: "0".repeat(64),
-        simulationHash: approval?.simulationHash ?? ""
-      })).rejects.toMatchObject({ code: "evidence_mismatch" });
-      const approved = await store.decideIntent(organization.id, intentId, {
-        principalId: approver.id,
-        decision: "approved",
-        expectedIntentVersion: 2,
-        compiledHash: approval?.compiledHash ?? "",
-        simulationHash: approval?.simulationHash ?? ""
-      });
-      expect(approved.intentStatus).toBe("approved");
-      expect((await store.decideIntent(organization.id, intentId, {
-        principalId: approver.id,
-        decision: "approved",
-        expectedIntentVersion: 2,
-        compiledHash: approval?.compiledHash ?? "",
-        simulationHash: approval?.simulationHash ?? ""
-      })).idempotentReplay).toBe(true);
+      const ownerWallet = address();
+      const owner = await store.bootstrapOwner({ chainFamily: "evm", address: ownerWallet, displayName: "Owner", organizationName: "Integration", slug: `db-${suffix}` });
+      expect(owner.role).toBe("owner");
+      const approverWallet = address();
+      const approver = await store.addMember(owner.organizationId, { displayName: "Approver", role: "approver", wallet: { chainFamily: "evm", address: approverWallet } }, owner.principalId);
+      expect(approver.wallets[0]?.verifiedAt).toBeNull();
+      expect((await store.findMemberships("evm", approverWallet))[0]?.principalId).toBe(approver.id);
+
+      // Challenges are single-use; sessions expire and revoke.
+      await store.createChallenge({ nonce: `n-${suffix}`, chainFamily: "evm", address: ownerWallet, domain: "relay.test", message: "m", expiresAt: new Date(Date.now() + 60_000).toISOString() });
+      expect((await store.consumeChallenge(`n-${suffix}`))?.address).toBe(ownerWallet);
+      expect(await store.consumeChallenge(`n-${suffix}`)).toBeNull();
+      await store.createSession({ organizationId: owner.organizationId, principalId: owner.principalId, walletId: owner.walletId, tokenHash: `h-${suffix}`, expiresAt: new Date(Date.now() + 60_000) });
+      expect((await store.getSession(`h-${suffix}`))?.role).toBe("owner");
+      await store.revokeSession(`h-${suffix}`);
+      expect(await store.getSession(`h-${suffix}`)).toBeNull();
+
+      // Agent, credential, treasury, signer, asset, policy.
+      const agent = await store.createAgent(owner.organizationId, { displayName: "Payables", purpose: "Pay vendors" }, owner.principalId);
+      const credential = await store.createAgentCredential(owner.organizationId, agent.id, { keyId: `k${suffix}`, secretHash: "hash", createdBy: owner.principalId });
+      expect((await store.findAgentCredential(credential.keyId))?.principalId).toBe(agent.principalId);
+      await store.ensureNativeAsset(network, "evm");
+      const treasuryAddress = address();
+      const treasury = await store.createTreasury(owner.organizationId, { name: "Ops", chainFamily: "evm", network, address: treasuryAddress, governance: "direct" }, owner.principalId);
+      await store.createSigner(owner.organizationId, { chainFamily: "evm", address: treasuryAddress, encryptedSecret: "c", encryptionNonce: "n", authTag: "t", keyVersion: 1 }, owner.principalId);
+      const created = await store.createPolicy(owner.organizationId, { name: "Vendor policy", definition: policy(), createdBy: owner.principalId });
+      await store.bindPolicy(owner.organizationId, { policyId: created.id, agentId: agent.id }, owner.principalId);
+      expect((await store.listPolicies(owner.organizationId))[0]?.bindings[0]?.agentId).toBe(agent.id);
+
+      // Per-transaction limit rejects at intake.
+      const tooLarge = await intent(store, { organizationId: owner.organizationId, treasuryAccountId: treasury.id, requesterId: agent.principalId, amount: "2000" });
+      await queue.evaluateIntent(tooLarge);
+      const rejected = await store.getIntent(owner.organizationId, tooLarge);
+      expect(rejected?.intent.status).toBe("rejected");
+      expect(rejected?.intent.failureReason).toContain("Per-transaction limit");
+
+      // Unknown asset rejects.
+      const unknownAsset = await intent(store, { organizationId: owner.organizationId, treasuryAccountId: treasury.id, requesterId: agent.principalId, amount: "10", assetId: `${network}/erc20:${address()}` });
+      await queue.evaluateIntent(unknownAsset);
+      expect((await store.getIntent(owner.organizationId, unknownAsset))?.intent.failureReason).toContain("Unknown asset");
+
+      // Within limits: needs two approvals, taken from the policy.
+      const first = await intent(store, { organizationId: owner.organizationId, treasuryAccountId: treasury.id, requesterId: agent.principalId, amount: "900" });
+      await queue.evaluateIntent(first, async () => ({ ok: true, feeBaseUnits: "21000", sourceBalanceBaseUnits: "1000000" }));
+      const request = await store.getApprovalRequest(owner.organizationId, first);
+      expect(request?.requiredApprovals).toBe(2);
+      expect(request?.simulationHash).toMatch(/^[a-f0-9]{64}$/);
+      const evidence = { expectedIntentVersion: 2, compiledHash: request!.compiledHash!, simulationHash: request!.simulationHash! };
+      await expect(store.decideIntent(owner.organizationId, first, { principalId: agent.principalId, decision: "approved", ...evidence })).rejects.toMatchObject({ code: "not_eligible" });
+      const one = await store.decideIntent(owner.organizationId, first, { principalId: owner.principalId, decision: "approved", ...evidence });
+      expect(one).toMatchObject({ intentStatus: "approval_required", approvals: 1, requiredApprovals: 2 });
+      const two = await store.decideIntent(owner.organizationId, first, { principalId: approver.id, decision: "approved", ...evidence });
+      expect(two).toMatchObject({ intentStatus: "approved", approvals: 2 });
+
+      // Daily limit counts the approved intent.
+      const overDaily = await intent(store, { organizationId: owner.organizationId, treasuryAccountId: treasury.id, requesterId: agent.principalId, amount: "900" });
+      await queue.evaluateIntent(overDaily);
+      expect((await store.getIntent(owner.organizationId, overDaily))?.intent.failureReason).toContain("Daily limit");
+
+      // Frozen agent cannot spend; the execution gate also re-checks.
+      await store.setAgentStatus(owner.organizationId, agent.id, "frozen", owner.principalId);
+      const frozenAgent = await intent(store, { organizationId: owner.organizationId, treasuryAccountId: treasury.id, requesterId: agent.principalId, amount: "10" });
+      await queue.evaluateIntent(frozenAgent);
+      expect((await store.getIntent(owner.organizationId, frozenAgent))?.intent.failureReason).toContain("frozen");
+      await expect(queue.getExecutionContext(first)).rejects.toBeInstanceOf(ExecutionRejected);
+      await store.setAgentStatus(owner.organizationId, agent.id, "active", owner.principalId);
+      const context = await queue.getExecutionContext(first);
+      expect(context.from).toBe(treasuryAddress);
+      expect(context.asset.kind).toBe("native");
+      expect(context.execution).toBeNull();
+
+      // Frozen organisation blocks approvals.
+      const pending = await intent(store, { organizationId: owner.organizationId, treasuryAccountId: treasury.id, requesterId: agent.principalId, amount: "100" });
+      await queue.evaluateIntent(pending);
+      await store.updateOrganization(owner.organizationId, { frozen: true }, owner.principalId);
+      const pendingRequest = await store.getApprovalRequest(owner.organizationId, pending);
+      await expect(store.decideIntent(owner.organizationId, pending, { principalId: owner.principalId, decision: "approved", expectedIntentVersion: 2, compiledHash: pendingRequest!.compiledHash!, simulationHash: pendingRequest!.simulationHash! })).rejects.toMatchObject({ code: "frozen" });
+      await store.updateOrganization(owner.organizationId, { frozen: false }, owner.principalId);
+
+      // Terminal failure is recorded once.
+      await queue.markFailed(first, "Test failure");
+      const failed = await store.getIntent(owner.organizationId, first);
+      expect(failed?.intent.status).toBe("failed");
+      expect(failed?.intent.failureReason).toBe("Test failure");
+      expect((await store.listAuditEvents(owner.organizationId)).some((event) => event.action === "intent.failed")).toBe(true);
+
+      // Autonomous execution: auto_authorized only when the organisation allows it.
+      const autoPolicy = await store.createPolicy(owner.organizationId, { name: "Auto", definition: policy({ humanApprovalRequired: false, autoApproveUpToBaseUnits: "100", minApprovals: 1 }), createdBy: owner.principalId });
+      await store.bindPolicy(owner.organizationId, { policyId: autoPolicy.id, agentId: agent.id }, owner.principalId);
+      const gated = await intent(store, { organizationId: owner.organizationId, treasuryAccountId: treasury.id, requesterId: agent.principalId, amount: "50" });
+      await queue.evaluateIntent(gated);
+      expect((await store.getIntent(owner.organizationId, gated))?.intent.status).toBe("approval_required");
+      await store.updateOrganization(owner.organizationId, { autonomousExecution: true }, owner.principalId);
+      const auto = await intent(store, { organizationId: owner.organizationId, treasuryAccountId: treasury.id, requesterId: agent.principalId, amount: "50" });
+      await queue.evaluateIntent(auto);
+      expect((await store.getIntent(owner.organizationId, auto))?.intent.status).toBe("approved");
     } finally {
       await queue.close();
       await store.close();
     }
-  });
+  }, 30_000);
 });

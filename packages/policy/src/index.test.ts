@@ -27,7 +27,9 @@ const policy: SpendingPolicy = {
   allowedNetworks: ["eip155:84532", "solana:devnet"],
   allowedAssets: [intent.assetId],
   allowedDestinations: [],
-  humanApprovalRequired: false
+  humanApprovalRequired: false,
+  allowedKinds: ["transfer", "x402"],
+  minApprovals: 1
 };
 
 describe("evaluatePaymentIntent", () => {
@@ -45,6 +47,14 @@ describe("evaluatePaymentIntent", () => {
       { spentTodayBaseUnits: "0", now: new Date("2026-09-16T00:00:00.000Z") }
     );
     expect(decision.outcome).toBe("approval_required");
+  });
+
+  it("rejects an intent kind the policy does not allow", () => {
+    const decision = evaluatePaymentIntent(intent, { ...policy, allowedKinds: ["transfer"] }, {
+      spentTodayBaseUnits: "0",
+      now: new Date("2026-09-16T00:00:00.000Z")
+    });
+    expect(decision).toEqual({ outcome: "rejected", reasons: ["Intent kind x402 is not allowed"] });
   });
 
   it("rejects a frozen policy even when limits permit payment", () => {

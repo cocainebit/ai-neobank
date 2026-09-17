@@ -11,13 +11,12 @@ Codex 2026-09-16/17, taken over by Claude 2026-09-17. Status report with evidenc
 
 | instance | writes | mid-way through |
 |---|---|---|
-| achi-b6 (Claude, takeover) | everything under this repo | closing the money-path security holes first (auth, policy, freezes, asset confusion, recoverable execution), then the milestone list |
+| achi-b6 (Claude, takeover) | everything under this repo | **done:** wallet auth, agent keys, policy/freeze/quorum on the durable path, sign-before-broadcast recovery, real finality, fee ledger, ERC-20/SPL. **next:** Safe + Squads on the intent path, x402, frontend on the real API |
 
 ## Ports (this repo's block is 8720-8729)
 
-    54339  Postgres (docker compose project `ai-neobank`, infra/docker-compose.yml)
-    8720   API            8721  web (next dev)
-    8722   anvil          8724  solana-test-validator RPC (ws 8725), faucet 8726
+    8720   API            8721  web (next dev)        8723  postgres (scripts/localnet.sh, not Docker)
+    8722   anvil          8724  solana-test-validator RPC (ws 8725), faucet 8726, gossip 8727, dynamic 8728-8799
 
 Never run integration tests against 8545/8899: those belong to other repos.
 `lsof -ti :<port>` before binding. Kill by PID only.

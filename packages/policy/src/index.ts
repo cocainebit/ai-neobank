@@ -1,12 +1,17 @@
 import type { PaymentIntent, PolicyDecision, SpendingPolicy } from "@ai-neobank/domain";
 
 export interface PolicyContext {
+  /** Base units of the intent's asset already committed today by the same principal. */
   spentTodayBaseUnits: string;
   now: Date;
 }
 
 const units = (value: string) => BigInt(value);
 
+/**
+ * Pure and deterministic. Runs at intake and again immediately before signing.
+ * Anything not explicitly allowed is rejected; unknown kinds never fall through.
+ */
 export function evaluatePaymentIntent(
   intent: PaymentIntent,
   policy: SpendingPolicy,
@@ -17,6 +22,7 @@ export function evaluatePaymentIntent(
 
   if (policy.frozen) rejectionReasons.push("Policy is frozen");
   if (new Date(intent.expiresAt) <= context.now) rejectionReasons.push("Intent has expired");
+  if (!policy.allowedKinds.includes(intent.kind)) rejectionReasons.push(`Intent kind ${intent.kind} is not allowed`);
   if (!policy.allowedNetworks.includes(intent.network)) rejectionReasons.push("Network is not allowed");
   if (!policy.allowedAssets.includes(intent.assetId)) rejectionReasons.push("Asset is not allowed");
   if (amount > units(policy.maxPerTransactionBaseUnits)) rejectionReasons.push("Per-transaction limit exceeded");
@@ -25,7 +31,7 @@ export function evaluatePaymentIntent(
   }
   if (
     policy.allowedDestinations.length > 0 &&
-    !policy.allowedDestinations.includes(intent.destination)
+    !policy.allowedDestinations.some((allowed) => allowed.toLowerCase() === intent.destination.toLowerCase())
   ) {
     rejectionReasons.push("Destination is not allowed");
   }

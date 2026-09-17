@@ -16,7 +16,21 @@
     "@ai-neobank/evm-adapter": "workspace:*",
     "@ai-neobank/signer": "workspace:*",
     "@ai-neobank/solana-adapter": "workspace:*",
-    "@solana/web3.js": "^1.98.4"
+    "@solana/web3.js": "^1.98.4",
+    "@ai-neobank/chain-core": "workspace:*",
+    "@ai-neobank/domain": "workspace:*"
   },
-  "devDependencies": { "@types/node": "^22.18.1", "tsx": "^4.20.5", "vitest": "^3.2.4" }
+  "devDependencies": {
+    "@types/node": "^22.18.1",
+    "tsx": "^4.20.5",
+    "vitest": "^3.2.4",
+    "@solana/spl-token": "^0.4.14",
+    "viem": "^2.37.3"
+  },
+  "exports": {
+    ".": {
+      "types": "./src/worker.ts",
+      "default": "./dist/worker.js"
+    }
+  }
 }

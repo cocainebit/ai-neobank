@@ -11,3 +11,4 @@ coverage/
 .firecrawl/
 playwright-report/
 test-results/
+.local/

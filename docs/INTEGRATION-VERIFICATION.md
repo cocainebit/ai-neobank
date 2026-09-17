@@ -16,25 +16,23 @@ API returns `200`. Each integration must pass its complete money-flow lifecycle.
 
 | Integration | Current status | Required proof |
 | --- | --- | --- |
-| Squads Protocol v4 | researched | Create multisig; deposit; create transaction and proposal; approve; execute; reject; expire; spending-limit transfer; timelock; reconcile chain events |
-| Solana RPC | e2e-local | Local validator health, balance, fee simulation, signed transfer, confirmation, fee capture, and destination reconciliation passed. Still required: two-provider devnet, reorg/fork handling, rate-limit and timeout failover |
-| Safe Protocol | e2e-local | Official Safe 1.4.1 singleton/factory/multisend/handler deployed on Anvil; 2-of-3 Safe predicted and deployed; owner/threshold/modules observed; funded; transaction hash built; one-signature execution rejected; two distinct owner signatures aggregated; transfer executed; receipt, destination balance, and nonce independently verified. Still required: Base Sepolia, rejection/replacement, reorg/provider outage, worker/ledger integration, hosted Transaction Service outage |
-| EVM RPC | e2e-local | Anvil health/chain-ID check, balance, gas simulation, signed transfer, receipt, fee capture, and destination reconciliation passed. Still required: Base Sepolia, nonce conflicts, replacement, reorg handling, provider failover |
-| x402 Solana | researched | Devnet 402 challenge; quote normalization; policy denial; exact payment; duplicate retry/idempotency; seller failure; external refund; reconciliation |
-| x402 EVM | researched | Base Sepolia 402 challenge; EIP-712 authorization; Safe/smart-account signature verification; policy denial; exact payment; duplicate retry/idempotency; refund; reconciliation |
-| Wallet connection | unselected | Connect, sign-in proof, network mismatch, transaction signing, rejection, disconnect, mobile path |
-| Encrypted software signer | contract-tested | EVM/Solana address generation, AES-256-GCM round trip, encrypted persistence, secret-free list API, agent binding, and default-off API gate passed. Still required: rotation, HSM migration, execution-worker isolation, backup recovery |
-| PostgreSQL | e2e-local | Initial migration, durable organization/agent persistence, transactional audit writes, intent idempotency, event/outbox creation, and real HTTP read-after-write passed. Still required: rollback, concurrency stress, backup and point-in-time restore exercise |
-| Durable worker | e2e-local | API-created intent, transactional outbox, deduplicated job creation, SKIP LOCKED lease, optimistic transition, and durable approval request passed. Still required: crash injection, lease recovery, concurrency stress, dead-letter operator flow |
-| Approval state machine | e2e-local | Human-role eligibility, quorum snapshot, intent-version binding, compiled/simulation hash binding, evidence mismatch denial, duplicate replay, durable audit/event records, scheduled expiry, rejection, and execution outbox gate implemented; PostgreSQL approve lifecycle passed. Wallet-authenticated approval proof remains gated on wallet authentication milestone |
-| Direct execution pipeline | e2e-local | Approved intent -> encrypted signer isolation -> compilation hash check -> fee simulation -> EVM/Solana signature -> broadcast -> confirmation -> receipt persistence -> balanced ledger entries -> reconciled state passed on Anvil and local Solana validator. Production execution remains disabled pending Safe/Squads and HSM gates |
-| Card issuing | disabled | Regulated program approval, KYC/KYB flow, sandbox authorization/decline/reversal/refund/dispute, signed production contract |
-| Banking rails | disabled | Regulated partner approval, account ownership checks, sanctions controls, sandbox payment lifecycle, signed production contract |
+| Wallet sign-in (EVM, Solana) | e2e-local | EIP-4361 and Sign-In With Solana challenge, signature verification, single-use nonce, session issue/revoke, cookie origin check passed in `apps/api/src/app.test.ts` and `packages/auth`. Still required: ERC-1271 smart-account owners, passkey step-up, browser wallet path |
+| Agent credentials | e2e-local | Hashed key issue, use, revoke, lock-out on organisation freeze and agent freeze passed. Still required: DPoP-style proof, rotation reminders |
+| Policy engine on the durable path | e2e-local | Bound policy evaluated at intake and again before signing; per-transaction, daily, asset, network, destination, kind; quorum from policy; freezes at intake, approval, and execution; unknown asset rejected (`packages/database/src/integration.test.ts`) |
+| Simulation evidence | e2e-local | Real chain simulation and source balance snapshot hashed into the approval request; insufficient balance rejected before any approval exists (`apps/worker/src/integration.test.ts`) |
+| Direct execution pipeline | e2e-local | Sign -> persist signed bytes and hash -> broadcast -> confirm at finality -> ledger (pending, settlement, fee) -> reconcile against observed destination delta, for native, ERC-20, SOL, and SPL. Crash injection between signing and broadcast: unsent transaction resent, already-sent transaction not sent twice, nonce reuse detected as dead |
+| EVM RPC | e2e-local | Anvil health, balances, gas and fee estimate, sign-before-broadcast, receipt with confirmation depth, destination delta from value or Transfer log. Still required: Base Sepolia, provider failover, reorg handling |
+| Solana RPC | e2e-local | Local validator health, balances, fee and simulation, sign-before-broadcast, `finalized` commitment, pre/post balance deltas for SOL and SPL, blockhash expiry detection. Still required: devnet, provider failover |
+| Safe Protocol | e2e-local (standalone) | 2-of-3 deploy, observe, hash, signature aggregation, execute on Anvil. Not wired into intents, approvals, or the ledger |
+| Squads Protocol v4 | researched | Program cloned into the local validator at genesis; no adapter yet |
+| x402 | researched | No implementation |
+| Encrypted software signer | contract-tested | Development custody only; refused in production and secret export refused outside development. Still required: KMS/HSM backend, key rotation |
+| PostgreSQL | e2e-local | Migrations 001-004, organisation-scoped composite foreign keys, transactional outbox, lease recovery for jobs left running by a crashed worker |
+| Card issuing, banking rails | disabled | Out of scope for the non-custodial launch |
 
 ## Automated verification rules
 
-- Integration tests run against Solana local validator on every pull request.
-- EVM integration tests run against Anvil on every pull request.
+- `pnpm test:integration` runs every suite against `scripts/localnet.sh` services. There is no CI workflow yet; that is part of the devnet certification milestone.
 - A shared adapter conformance suite must pass unchanged for Squads/Solana and
   Safe/EVM wherever their capabilities overlap.
 - Hosted devnet tests run on a schedule and before release, never from forks with
@@ -139,3 +137,20 @@ remain disabled until their proposal/approval/execution suites pass.
 - x402 seller quickstart: https://github.com/coinbase/x402/blob/main/docs/getting-started/quickstart-for-sellers.mdx
 - CDP x402 facilitator: https://docs.cdp.coinbase.com/x402/seller/facilitator
 - Solana TypeScript SDK guidance: https://solana.com/docs/clients/official/javascript
+
+## Verified local execution after the takeover: 2026-09-17
+
+- Runtime: Homebrew PostgreSQL 16 on :8723, Anvil 1.7.1 on :8722, Agave
+  `solana-test-validator` 3.1.12 on :8724 with the Squads v4 program cloned from
+  devnet.
+- Command: `pnpm test:integration`.
+- Suites: `packages/auth` (5 unit), `packages/database` (identity, policy,
+  quorum, freezes, execution gating, autonomous gate), `packages/evm-adapter`
+  (native + ERC-20, nonce-dead detection), `packages/solana-adapter` (SOL +
+  SPL at finalized commitment), `apps/worker` (EVM native + ERC-20 to
+  reconciled; two crash-injection recoveries; Solana SOL + SPL to reconciled),
+  `apps/api` (wallet sign-in through execution over HTTP), `packages/safe-adapter`
+  (standalone 2-of-3).
+- Boundary: direct treasuries with development software signers only. Safe and
+  Squads governance are not yet on the intent path; nothing has run on a public
+  test network.

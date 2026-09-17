@@ -1,15 +1,26 @@
 import { buildApp } from "./app.js";
-import { createPostgresStore } from "@ai-neobank/database";
+import { createPostgresJobQueue, createPostgresStore } from "@ai-neobank/database";
 import { parseMasterKey } from "@ai-neobank/signer";
 
-const port = Number(process.env.PORT ?? 4000);
-const host = process.env.HOST ?? "127.0.0.1";
+const env = process.env;
+const databaseUrl = env.DATABASE_URL;
+if (!databaseUrl) throw new Error("DATABASE_URL is required");
+const environment = (env.RELAY_ENVIRONMENT ?? "development") as "development" | "test" | "production";
+const port = Number(env.PORT ?? 8720);
+const host = env.HOST ?? "127.0.0.1";
+const evmChainId = env.EVM_CHAIN_ID ? Number(env.EVM_CHAIN_ID) : undefined;
+const signerMasterKey = env.SIGNER_MASTER_KEY ? parseMasterKey(env.SIGNER_MASTER_KEY) : undefined;
 
-const signerMasterKey = process.env.SIGNER_MASTER_KEY ? parseMasterKey(process.env.SIGNER_MASTER_KEY) : undefined;
-const signerOptions = signerMasterKey && process.env.ALLOW_SOFTWARE_SIGNERS === "true"
-  ? { signerMasterKey, allowSoftwareSigners: true }
-  : {};
-const app = process.env.DATABASE_URL
-  ? buildApp({ store: createPostgresStore(process.env.DATABASE_URL), ...signerOptions })
-  : buildApp(signerOptions);
+const app = buildApp({
+  store: createPostgresStore(databaseUrl),
+  queue: createPostgresJobQueue(databaseUrl),
+  environment,
+  auth: { domain: env.AUTH_DOMAIN ?? "localhost", uri: env.AUTH_URI ?? `http://localhost:${port}` },
+  ...(env.WEB_ORIGIN ? { webOrigin: env.WEB_ORIGIN } : {}),
+  ...(signerMasterKey && env.ALLOW_SOFTWARE_SIGNERS === "true" && environment !== "production" ? { signerMasterKey, allowSoftwareSigners: true } : {}),
+  chains: {
+    ...(env.EVM_RPC_URL && evmChainId ? { evm: { rpcUrl: env.EVM_RPC_URL, chainId: evmChainId, network: `eip155:${evmChainId}` as const, confirmations: Number(env.EVM_CONFIRMATIONS ?? 1) } } : {}),
+    ...(env.SOLANA_RPC_URL && env.SOLANA_NETWORK ? { solana: { rpcUrl: env.SOLANA_RPC_URL, network: env.SOLANA_NETWORK as `solana:${string}`, finality: (env.SOLANA_FINALITY as "confirmed" | "finalized" | undefined) ?? "finalized" } } : {})
+  }
+});
 await app.listen({ port, host });

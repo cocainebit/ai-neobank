@@ -1,0 +1,26 @@
+{
+  "name": "@ai-neobank/web",
+  "version": "0.0.0",
+  "private": true,
+  "scripts": {
+    "build": "next build",
+    "dev": "next dev",
+    "start": "next start",
+    "test": "vitest run --passWithNoTests --exclude 'e2e/**'",
+    "test:e2e": "playwright test",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "next": "^15.5.3",
+    "react": "^19.1.1",
+    "react-dom": "^19.1.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.18.1",
+    "@types/react": "^19.1.12",
+    "@types/react-dom": "^19.1.9",
+    "playwright": "^1.63.0",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.4"
+  }
+}

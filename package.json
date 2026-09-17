@@ -1,0 +1,23 @@
+{
+  "name": "ai-neobank",
+  "private": true,
+  "packageManager": "pnpm@10.30.3",
+  "scripts": {
+    "build": "turbo build",
+    "dev": "turbo dev",
+    "dev:web": "pnpm --filter @ai-neobank/web dev",
+    "dev:api": "pnpm --filter @ai-neobank/api dev",
+    "dev:worker": "pnpm --filter @ai-neobank/worker dev",
+    "test": "turbo test",
+    "test:integration:evm": "RUN_CHAIN_INTEGRATION=1 pnpm --filter @ai-neobank/evm-adapter test:integration",
+    "test:integration:database": "RUN_DATABASE_INTEGRATION=1 pnpm --filter @ai-neobank/database test:integration",
+    "test:integration:worker": "RUN_WORKER_INTEGRATION=1 pnpm --filter @ai-neobank/worker test:integration",
+    "test:integration:solana": "RUN_CHAIN_INTEGRATION=1 pnpm --filter @ai-neobank/solana-adapter test:integration",
+    "test:integration:safe": "RUN_SAFE_INTEGRATION=1 pnpm --filter @ai-neobank/safe-adapter test:integration",
+    "typecheck": "turbo typecheck"
+  },
+  "devDependencies": {
+    "turbo": "^2.5.6",
+    "typescript": "^5.9.2"
+  }
+}

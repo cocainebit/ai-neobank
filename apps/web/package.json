@@ -4,8 +4,8 @@
   "private": true,
   "scripts": {
     "build": "next build",
-    "dev": "next dev",
-    "start": "next start",
+    "dev": "next dev -p 8721",
+    "start": "next start -p 8721",
     "test": "vitest run --passWithNoTests --exclude 'e2e/**'",
     "test:e2e": "playwright test",
     "typecheck": "tsc --noEmit"
@@ -13,7 +13,13 @@
   "dependencies": {
     "next": "^15.5.3",
     "react": "^19.1.1",
-    "react-dom": "^19.1.1"
+    "react-dom": "^19.1.1",
+    "geist": "^1.4.2",
+    "viem": "^2.37.3",
+    "@solana/web3.js": "^1.98.4",
+    "bs58": "^5.0.0",
+    "@noble/curves": "^1.9.7",
+    "qrcode": "^1.5.4"
   },
   "devDependencies": {
     "@types/node": "^22.18.1",
@@ -21,6 +27,7 @@
     "@types/react-dom": "^19.1.9",
     "playwright": "^1.63.0",
     "typescript": "^5.9.3",
-    "vitest": "^3.2.4"
+    "vitest": "^3.2.4",
+    "@types/qrcode": "^1.5.5"
   }
 }

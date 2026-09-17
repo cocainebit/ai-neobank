@@ -30,7 +30,8 @@
     "@ai-neobank/x402-adapter": "workspace:*",
     "@x402/core": "2.26.0",
     "@x402/evm": "2.26.0",
-    "@x402/svm": "2.26.0"
+    "@x402/svm": "2.26.0",
+    "bs58": "^5.0.0"
   },
   "devDependencies": {
     "tsx": "^4.20.5",

@@ -4,6 +4,7 @@ import cors from "@fastify/cors";
 import { ApprovalError, OperationsError, OperationsStore, RotationStore, type PostgresControlPlaneStore, type PostgresJobQueue, type SessionRecord } from "@ai-neobank/database";
 import type { FacilitatorClient } from "@x402/core/server";
 import { registerOperationsRoutes } from "./operations-routes.js";
+import { registerWalletRoutes } from "./wallet-routes.js";
 import { paymentIntentSchema, policyDefinitionSchema, spendingPolicySchema, tokenAssetId, type PrincipalRole } from "@ai-neobank/domain";
 import { evaluatePaymentIntent } from "@ai-neobank/policy";
 import { LocalKeyring, evmAddressFromSpki, exportDevelopmentSecret, generateSigner, sealSecret, type KeyEncryptionProvider, type KmsClient } from "@ai-neobank/signer";
@@ -285,7 +286,7 @@ export function buildApp(options: AppOptions) {
     let memberships = await store.findMemberships(body.data.chainFamily, address);
     if (memberships.length === 0) {
       const short = `${address.slice(0, 6)}…${address.slice(-4)}`;
-      memberships = [await store.bootstrapOwner({ chainFamily: body.data.chainFamily, address, displayName: short, organizationName: `${short} workspace`, slug: `org-${generateNonce().slice(0, 12)}` })];
+      memberships = [await store.bootstrapOwner({ chainFamily: body.data.chainFamily, address, displayName: short, organizationName: "My workspace", slug: `org-${generateNonce().slice(0, 12)}` })];
     }
     const active = memberships.filter((membership) => membership.principalStatus === "active");
     if (active.length === 0) return reply.code(403).send({ error: "no_active_membership" });
@@ -517,7 +518,12 @@ export function buildApp(options: AppOptions) {
     try { owners = body.data.owners.map((owner) => canonicalAddress(family, owner)); } catch { return invalid(reply, "Invalid owner address"); }
     if (body.data.governance === "safe") {
       if (!safeAdapter || options.chains?.evm?.network !== body.data.network) return reply.code(503).send({ error: "network_not_configured" });
-      const prepared = await safeAdapter.prepareDeployment(owners, body.data.threshold);
+      let prepared;
+      try {
+        prepared = await safeAdapter.prepareDeployment(owners, body.data.threshold);
+      } catch (error) {
+        return reply.code(503).send({ error: "safe_contracts_unavailable", message: `Safe contracts are not available on ${body.data.network}. On a local chain, run scripts/localnet.sh up to deploy them. (${error instanceof Error ? error.message : "unknown"})` });
+      }
       return { data: { governance: "safe", network: body.data.network, predictedAddress: prepared.address, transaction: { to: prepared.to, data: prepared.data, value: prepared.value }, saltNonce: prepared.saltNonce, owners, threshold: body.data.threshold, executor: signer.address } };
     }
     if (!squadsAdapter || !solanaAdapter || options.chains?.solana?.network !== body.data.network) return reply.code(503).send({ error: "network_not_configured" });
@@ -884,6 +890,13 @@ export function buildApp(options: AppOptions) {
       if (error instanceof X402QuoteError) return reply.code(422).send({ error: `x402_${error.code}`, message: error.message });
       throw error;
     }
+  });
+
+  registerWalletRoutes(app, {
+    environment: options.environment,
+    human,
+    evm: evmAdapter && options.chains?.evm ? { adapter: evmAdapter, rpcUrl: options.chains.evm.rpcUrl, chainId: options.chains.evm.chainId } : null,
+    solana: solanaAdapter && options.chains?.solana ? { adapter: solanaAdapter, rpcUrl: options.chains.solana.rpcUrl, network: options.chains.solana.network } : null
   });
 
   registerOperationsRoutes(app, { options, store, operations, queue, human, adapters: { evm: evmAdapter, solana: solanaAdapter }, wireNetwork: async (family, network) => family === "evm" ? network : (options.chains?.solana?.x402Network ?? await solanaWireNetwork(network, options.chains?.solana?.rpcUrl ?? "")) });

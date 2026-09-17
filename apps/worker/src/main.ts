@@ -1,5 +1,6 @@
 import { createWorker } from "./worker.js";
 import { keyConfigurationFromEnv } from "@ai-neobank/signer";
+import { existsSync, readFileSync } from "node:fs";
 
 const env = process.env;
 const databaseUrl = env.DATABASE_URL;
@@ -8,10 +9,11 @@ const pollMs = Number(env.WORKER_POLL_MS ?? 500);
 const keyConfiguration = await keyConfigurationFromEnv(env);
 console.log(`Signer keys: ${keyConfiguration.description}`);
 const evmChainId = env.EVM_CHAIN_ID ? Number(env.EVM_CHAIN_ID) : undefined;
+const safeContracts = env.SAFE_CONTRACTS_FILE && existsSync(env.SAFE_CONTRACTS_FILE) ? JSON.parse(readFileSync(env.SAFE_CONTRACTS_FILE, "utf8")) : undefined;
 const chainConfig = keyConfiguration.keys || keyConfiguration.kms ? {
   ...(keyConfiguration.keys ? { keys: keyConfiguration.keys } : {}),
   ...(keyConfiguration.kms ? { kms: keyConfiguration.kms } : {}),
-  ...(env.EVM_RPC_URL && evmChainId ? { evm: { rpcUrl: env.EVM_RPC_URL, chainId: evmChainId, network: `eip155:${evmChainId}` as const, confirmations: Number(env.EVM_CONFIRMATIONS ?? 1) } } : {}),
+  ...(env.EVM_RPC_URL && evmChainId ? { evm: { rpcUrl: env.EVM_RPC_URL, chainId: evmChainId, network: `eip155:${evmChainId}` as const, confirmations: Number(env.EVM_CONFIRMATIONS ?? 1), ...(safeContracts ? { safeContracts } : {}) } } : {}),
   ...(env.SOLANA_RPC_URL && env.SOLANA_NETWORK ? { solana: { rpcUrl: env.SOLANA_RPC_URL, network: env.SOLANA_NETWORK as `solana:${string}`, finality: (env.SOLANA_FINALITY as "confirmed" | "finalized" | undefined) ?? "finalized", ...(env.SOLANA_X402_NETWORK ? { x402Network: env.SOLANA_X402_NETWORK } : {}) } } : {})
 } : undefined;
 if (!chainConfig) console.warn("No signer keys configured: the worker will evaluate and expire intents but cannot execute them");

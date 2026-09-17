@@ -60,7 +60,7 @@ up() {
       --rpc-port $SOL_RPC \
       --faucet-port $SOL_FAUCET \
       --gossip-port 8727 \
-      --dynamic-port-range 8728-8799 \
+      --dynamic-port-range 8730-8755 \
       --bind-address 127.0.0.1 \
       --url https://api.devnet.solana.com \
       --clone-upgradeable-program $SQUADS_PROGRAM \
@@ -74,7 +74,9 @@ up() {
   for _ in $(seq 1 60); do
     if curl -sf -m 2 "http://127.0.0.1:$SOL_RPC" -X POST -H 'content-type: application/json' \
       -d '{"jsonrpc":"2.0","id":1,"method":"getHealth"}' | grep -q '"ok"'; then
-      echo "validator healthy"; status; return
+      echo "validator healthy"
+      (cd "$ROOT" && EVM_RPC_URL="http://127.0.0.1:$ANVIL_PORT" pnpm --silent --filter @ai-neobank/worker exec tsx src/deploy-safe-local.ts) || echo "Safe fixture deployment failed; Safe treasuries will be unavailable locally" >&2
+      status; return
     fi
     sleep 2
   done

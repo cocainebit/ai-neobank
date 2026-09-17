@@ -895,6 +895,7 @@ export function buildApp(options: AppOptions) {
   registerWalletRoutes(app, {
     environment: options.environment,
     human,
+    asset: (assetId) => store.getAsset(assetId),
     evm: evmAdapter && options.chains?.evm ? { adapter: evmAdapter, rpcUrl: options.chains.evm.rpcUrl, chainId: options.chains.evm.chainId } : null,
     solana: solanaAdapter && options.chains?.solana ? { adapter: solanaAdapter, rpcUrl: options.chains.solana.rpcUrl, network: options.chains.solana.network } : null
   });
@@ -925,8 +926,8 @@ export function buildApp(options: AppOptions) {
     if (!queue) return reply.code(503).send({ error: "queue_not_configured" });
     const query = z.object({ status: z.string().optional() }).safeParse(request.query);
     if (!query.success) return invalid(reply, query.error.flatten());
-    const jobs = await queue.listJobs({ ...(query.data.status ? { status: query.data.status } : {}) });
-    return { data: jobs.filter((job) => job.organizationId === auth.organizationId).map(({ payload, ...job }) => ({ ...job, intentId: payload.intentId ?? null })) };
+    const jobs = await queue.listJobs({ organizationId: auth.organizationId, ...(query.data.status ? { status: query.data.status } : {}) });
+    return { data: jobs.map(({ payload, ...job }) => ({ ...job, intentId: payload.intentId ?? null })) };
   });
 
   return app;

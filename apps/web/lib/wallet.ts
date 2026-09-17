@@ -54,6 +54,8 @@ function devEvmProvider(): EvmProvider {
   return {
     async request({ method, params = [] }) {
       if (method === "eth_requestAccounts" || method === "eth_accounts") return [account.address];
+      if (method === "eth_chainId") return await (await fetch(rpcUrl, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_chainId", params: [] }) })).json().then((body: { result: string }) => body.result);
+      if (method === "wallet_switchEthereumChain") throw new Error("The development wallet only uses the local chain");
       if (method === "personal_sign") return account.signMessage({ message: { raw: params[0] as Hex } });
       if (method === "eth_signTypedData_v4") {
         const typed = JSON.parse(String(params[1])) as { domain: Record<string, unknown>; types: Record<string, unknown>; primaryType: string; message: Record<string, unknown> };
@@ -125,6 +127,17 @@ export async function signEvmTypedData(address: string, typedData: unknown): Pro
 export async function sendEvmTransaction(address: string, transaction: { to: string; data: string; value: string }): Promise<string> {
   const value = `0x${BigInt(transaction.value || "0").toString(16)}`;
   return await evm().request({ method: "eth_sendTransaction", params: [{ from: address, to: transaction.to, data: transaction.data, value }] }) as string;
+}
+
+/** Asks the wallet to move to `chainId` when it is elsewhere; wallets that cannot switch leave the payer to do it. */
+export async function ensureEvmChain(chainId: number): Promise<void> {
+  const current = Number(await evm().request({ method: "eth_chainId" }));
+  if (current === chainId) return;
+  try {
+    await evm().request({ method: "wallet_switchEthereumChain", params: [{ chainId: `0x${chainId.toString(16)}` }] });
+  } catch {
+    throw new Error(`Switch your wallet to chain ${chainId}. It is on chain ${current}.`);
+  }
 }
 
 export async function connectSolana(): Promise<string> {

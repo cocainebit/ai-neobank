@@ -187,7 +187,7 @@ const intentJoin = `
     t.executor_signer_id::text as "executorSignerId", t.observed_configuration as "observedConfiguration", i.publication, i.policy_decision as "policyDecision",
     i.idempotency_key as "idempotencyKey", i.kind, i.network, i.asset_id as "assetId",
     a.kind as "assetKind", a.address as "assetAddress", a.decimals as "assetDecimals", a.network as "assetNetwork",
-    i.amount_base_units::text as "amountBaseUnits", i.destination, i.purpose, i.status, i.version, i.expires_at::text as "expiresAt",
+    i.amount_base_units::text as "amountBaseUnits", i.destination, i.purpose, i.status, i.version, to_char(i.expires_at at time zone 'utc', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as "expiresAt",
     encode(digest(concat_ws('|', i.id::text, i.network, i.asset_id, i.amount_base_units::text, i.destination, i.kind), 'sha256'), 'hex') as "compiledHash"
   from intents i
   join organizations o on o.id = i.organization_id
@@ -318,27 +318,34 @@ export class PostgresJobQueue {
     `;
   }
 
-  async listJobs(filter: { status?: string; limit?: number } = {}): Promise<(JobRecord & { status: string; lastError: string | null; runAt: string })[]> {
+  async listJobs(filter: { organizationId?: string; status?: string; limit?: number } = {}): Promise<(JobRecord & { status: string; lastError: string | null; runAt: string })[]> {
     return this.sql<(JobRecord & { status: string; lastError: string | null; runAt: string })[]>`
-      select id::text, organization_id::text as "organizationId", type, payload, attempts, max_attempts as "maxAttempts", status, last_error as "lastError", run_at::text as "runAt"
-      from jobs where (${filter.status ?? null}::text is null or status = ${filter.status ?? null}) order by created_at desc limit ${filter.limit ?? 100}
+      select id::text, organization_id::text as "organizationId", type, payload, attempts, max_attempts as "maxAttempts", status, last_error as "lastError", to_char(run_at at time zone 'utc', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as "runAt"
+      from jobs
+      where (${filter.status ?? null}::text is null or status = ${filter.status ?? null})
+        and (${filter.organizationId ?? null}::uuid is null or organization_id = ${filter.organizationId ?? null}::uuid)
+      order by created_at desc limit ${filter.limit ?? 100}
     `;
   }
 
   // Policy
 
   private async loadPolicy(tx: Db, organizationId: string, requesterId: string, treasuryId: string): Promise<{ versionId: string; policy: SpendingPolicy } | null> {
+    // An agent's own policy takes precedence over the treasury's.
     const rows = await tx<{ id: string; version: number; policyId: string; definition: unknown }[]>`
-      select pv.id::text, pv.version, pv.policy_id::text as "policyId", pv.definition
-      from policy_bindings b
-      join policy_versions pv on pv.id = b.policy_version_id
-      join agents ag on ag.id = b.agent_id
-      where b.organization_id = ${organizationId} and ag.principal_id = ${requesterId} and b.treasury_account_id is null and pv.status = 'active'
-      union all
-      select pv.id::text, pv.version, pv.policy_id::text, pv.definition
-      from policy_bindings b
-      join policy_versions pv on pv.id = b.policy_version_id
-      where b.organization_id = ${organizationId} and b.treasury_account_id = ${treasuryId} and b.agent_id is null and pv.status = 'active'
+      select id, version, "policyId", definition from (
+        select pv.id::text as id, pv.version, pv.policy_id::text as "policyId", pv.definition, 0 as precedence, b.created_at
+        from policy_bindings b
+        join policy_versions pv on pv.id = b.policy_version_id
+        join agents ag on ag.id = b.agent_id
+        where b.organization_id = ${organizationId} and ag.principal_id = ${requesterId} and b.treasury_account_id is null and pv.status = 'active'
+        union all
+        select pv.id::text, pv.version, pv.policy_id::text, pv.definition, 1, b.created_at
+        from policy_bindings b
+        join policy_versions pv on pv.id = b.policy_version_id
+        where b.organization_id = ${organizationId} and b.treasury_account_id = ${treasuryId} and b.agent_id is null and pv.status = 'active'
+      ) candidates
+      order by precedence, created_at
       limit 1
     `;
     const row = rows[0];
@@ -529,7 +536,7 @@ export class PostgresJobQueue {
   async completePublication(intentId: string, result: { compiledHash: string; requiredApprovals: number; externalRef: Record<string, unknown> }): Promise<void> {
     await this.sql.begin(async (tx) => {
       const rows = await tx<{ organizationId: string; status: string; version: number; expiresAt: string; governance: string; simulationHash: string | null }[]>`
-        select i.organization_id::text as "organizationId", i.status, i.version, i.expires_at::text as "expiresAt", t.governance, i.policy_decision->>'simulationHash' as "simulationHash"
+        select i.organization_id::text as "organizationId", i.status, i.version, to_char(i.expires_at at time zone 'utc', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as "expiresAt", t.governance, i.policy_decision->>'simulationHash' as "simulationHash"
         from intents i join treasury_accounts t on t.id = i.treasury_account_id where i.id = ${intentId} for update of i
       `;
       const row = rows[0];
@@ -558,7 +565,7 @@ export class PostgresJobQueue {
    */
   async observeProposal(intentId: string, observe: Observer): Promise<void> {
     const rows = await this.sql<{ organizationId: string; status: string; version: number; requestStatus: string; externalRef: Record<string, unknown> | null; expiresAt: string; chainFamily: "evm" | "svm"; network: string; treasuryConfiguration: Record<string, unknown> }[]>`
-      select i.organization_id::text as "organizationId", i.status, i.version, ar.status as "requestStatus", ar.external_ref as "externalRef", ar.expires_at::text as "expiresAt",
+      select i.organization_id::text as "organizationId", i.status, i.version, ar.status as "requestStatus", ar.external_ref as "externalRef", to_char(ar.expires_at at time zone 'utc', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as "expiresAt",
         t.chain_family as "chainFamily", i.network, t.observed_configuration as "treasuryConfiguration"
       from intents i join approval_requests ar on ar.intent_id = i.id join treasury_accounts t on t.id = i.treasury_account_id where i.id = ${intentId}
     `;
@@ -611,7 +618,7 @@ export class PostgresJobQueue {
     await this.sql.begin(async (tx) => {
       const rows = await tx<{ organizationId: string; status: string; version: number; requestStatus: string; expiresAt: string }[]>`
         select i.organization_id::text as "organizationId", i.status, i.version,
-          ar.status as "requestStatus", ar.expires_at::text as "expiresAt"
+          ar.status as "requestStatus", to_char(ar.expires_at at time zone 'utc', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as "expiresAt"
         from intents i join approval_requests ar on ar.intent_id = i.id
         where i.id = ${intentId} for update of i, ar
       `;

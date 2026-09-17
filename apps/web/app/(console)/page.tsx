@@ -9,7 +9,7 @@ import { useSession } from "../../components/session";
 import { BalanceList } from "../../components/treasury-balances";
 import { Ago, Amount, Empty, LoadingRows, Pill } from "../../components/ui";
 import { useApi } from "../../lib/api";
-import { assetMeta, governanceLabel, useAgents, useAssets, useIntents, usePrincipalNames, useTreasuries } from "../../lib/data";
+import { assetMeta, governanceLabel, useAgents, useAssets, useIntents, usePolicies, usePrincipalNames, useTreasuries } from "../../lib/data";
 import { intentStatus, networkLabel, shortAddress } from "../../lib/format";
 import type { Inflow, Invoice, Reconciliation } from "../../lib/types";
 
@@ -21,6 +21,7 @@ export default function OverviewPage() {
   const assets = useAssets();
   const names = usePrincipalNames();
   const invoices = useApi<Invoice[]>("/v1/invoices");
+  const policies = usePolicies();
   const inflows = useApi<Inflow[]>("/v1/inflows", { refreshMs: 20_000 });
   const reconciliations = useApi<Reconciliation[]>("/v1/reconciliation", { refreshMs: 20_000 });
   const [open, setOpen] = useState<string | null>(null);
@@ -65,6 +66,8 @@ export default function OverviewPage() {
           <div><span className="eyebrow">Agents active</span><div className="value">{agents.data ? activeAgents.length : "–"}</div><div className="sub">{agents.data ? `${agents.data.length - activeAgents.length} frozen or revoked` : " "}</div></div>
         </div>
       </section>
+
+      <SetupChecklist treasuries={(treasuries.data ?? []).length} policies={policies.data?.length ?? 0} agents={agents.data?.length ?? 0} payments={all.length} ready={Boolean(treasuries.data && policies.data && agents.data && intents.data)} />
 
       {breaks.length > 0 && (
         <div className="notice negative" style={{ marginBottom: 16 }}><Icons.Alert /><div><b>{breaks.length} reconciliation difference{breaks.length === 1 ? "" : "s"}.</b> A treasury's chain balance does not match the ledger. Deposits the indexer cannot see (such as contract-internal transfers) cause this; check <Link href="/statements" style={{ textDecoration: "underline" }}>Statements</Link>.</div></div>
@@ -175,5 +178,34 @@ export default function OverviewPage() {
       {open && <IntentDrawer intentId={open} onClose={() => setOpen(null)} />}
       {creating && <NewPayment onClose={() => setCreating(false)} onCreated={(intent) => setOpen(intent.id)} />}
     </>
+  );
+}
+
+/** Shown until a workspace can actually run money end to end; disappears for good once it can. */
+function SetupChecklist({ treasuries, policies, agents, payments, ready }: { treasuries: number; policies: number; agents: number; payments: number; ready: boolean }) {
+  const steps = [
+    { done: treasuries > 0, href: "/treasuries", title: "Add a treasury", body: "Deploy a Safe, create a Squads vault, or connect one you already own." },
+    { done: agents > 0, href: "/agents", title: "Create an agent and its key", body: "The key is shown once and belongs in your agent runtime's secret store." },
+    { done: policies > 0, href: "/policies", title: "Set a spending policy", body: "Caps per payment and per day, and how much may go through without a person." },
+    { done: payments > 0, href: "/payments", title: "Make the first payment", body: "Request one here, or let the agent request it through the API." }
+  ];
+  const remaining = steps.filter((step) => !step.done).length;
+  if (!ready || remaining === 0) return null;
+  return (
+    <section className="panel milled" style={{ marginBottom: 16 }}>
+      <header className="panel-head">
+        <div><h2>Finish setting up</h2><p>{steps.length - remaining} of {steps.length} done</p></div>
+        <div style={{ width: 140 }}><div className="progress"><i style={{ width: `${((steps.length - remaining) / steps.length) * 100}%` }} /></div></div>
+      </header>
+      <div className="rows">
+        {steps.map((step) => (
+          <Link key={step.href} href={step.href} className="row-icon">
+            <span className="icon-tile" style={step.done ? { color: "var(--positive)", borderColor: "color-mix(in oklab, var(--positive) 40%, transparent)" } : undefined}>{step.done ? <Icons.Check /> : <Icons.ChevronRight />}</span>
+            <span className="cell-title"><b style={step.done ? { color: "var(--dim)", textDecoration: "line-through" } : undefined}>{step.title}</b><span>{step.body}</span></span>
+            {!step.done && <span className="faint" style={{ fontSize: 12.5 }}>Open</span>}
+          </Link>
+        ))}
+      </div>
+    </section>
   );
 }

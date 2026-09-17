@@ -2,7 +2,7 @@ import { buildApp } from "./app.js";
 import { createPostgresJobQueue, createPostgresStore } from "@ai-neobank/database";
 import { keyConfigurationFromEnv } from "@ai-neobank/signer";
 import { HTTPFacilitatorClient } from "@x402/core/server";
-import { existsSync, readFileSync } from "node:fs";
+import { readLocalSafeContracts } from "./local-fixtures.js";
 
 const env = process.env;
 const databaseUrl = env.DATABASE_URL;
@@ -13,7 +13,7 @@ const host = env.HOST ?? "127.0.0.1";
 const evmChainId = env.EVM_CHAIN_ID ? Number(env.EVM_CHAIN_ID) : undefined;
 const keyConfiguration = await keyConfigurationFromEnv(env);
 // Local chains have no canonical Safe deployments; scripts/localnet.sh records fixture addresses here.
-const safeContracts = env.SAFE_CONTRACTS_FILE && existsSync(env.SAFE_CONTRACTS_FILE) ? JSON.parse(readFileSync(env.SAFE_CONTRACTS_FILE, "utf8")) : undefined;
+const safeContracts = readLocalSafeContracts(env.LOCAL_FIXTURES_FILE);
 
 const app = buildApp({
   store: createPostgresStore(databaseUrl),

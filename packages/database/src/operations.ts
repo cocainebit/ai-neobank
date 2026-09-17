@@ -129,21 +129,21 @@ export class OperationsError extends Error {
 }
 
 const beneficiaryColumns = `id::text, organization_id::text as "organizationId", name, chain_family as "chainFamily", network, address, email, notes, status,
-  created_by::text as "createdBy", approved_by::text as "approvedBy", approved_at::text as "approvedAt", created_at::text as "createdAt"`;
+  created_by::text as "createdBy", approved_by::text as "approvedBy", to_char(approved_at at time zone 'utc', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as "approvedAt", to_char(created_at at time zone 'utc', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as "createdAt"`;
 const scheduleColumns = `id::text, organization_id::text as "organizationId", treasury_account_id::text as "treasuryAccountId", beneficiary_id::text as "beneficiaryId",
   requester_principal_id::text as "requesterPrincipalId", asset_id as "assetId", amount_base_units::text as "amountBaseUnits", purpose,
-  interval_unit as "intervalUnit", interval_count as "intervalCount", start_at::text as "startAt", end_at::text as "endAt", max_occurrences as "maxOccurrences",
-  next_run_at::text as "nextRunAt", occurrences_created as "occurrencesCreated", status, created_at::text as "createdAt"`;
+  interval_unit as "intervalUnit", interval_count as "intervalCount", to_char(start_at at time zone 'utc', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as "startAt", to_char(end_at at time zone 'utc', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as "endAt", max_occurrences as "maxOccurrences",
+  to_char(next_run_at at time zone 'utc', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as "nextRunAt", occurrences_created as "occurrencesCreated", status, to_char(created_at at time zone 'utc', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as "createdAt"`;
 const invoiceColumnsFor = (t: string) => `${t}.id::text, ${t}.organization_id::text as "organizationId", ${t}.number, ${t}.treasury_account_id::text as "treasuryAccountId", ${t}.asset_id as "assetId", ${t}.network,
   ${t}.customer_name as "customerName", ${t}.customer_email as "customerEmail", ${t}.memo, ${t}.line_items as "lineItems", ${t}.subtotal_base_units::text as "subtotalBaseUnits",
   ${t}.amount_due_base_units::text as "amountDueBaseUnits", ${t}.amount_paid_base_units::text as "amountPaidBaseUnits", ${t}.reference, ${t}.public_token as "publicToken", ${t}.status,
-  ${t}.issued_at::text as "issuedAt", ${t}.due_at::text as "dueAt", ${t}.paid_at::text as "paidAt", ${t}.created_at::text as "createdAt"`;
+  to_char(${t}.issued_at at time zone 'utc', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as "issuedAt", to_char(${t}.due_at at time zone 'utc', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as "dueAt", to_char(${t}.paid_at at time zone 'utc', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as "paidAt", to_char(${t}.created_at at time zone 'utc', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as "createdAt"`;
 const invoiceColumns = invoiceColumnsFor("invoices");
 const inflowColumns = `id::text, treasury_account_id::text as "treasuryAccountId", network, asset_id as "assetId", transaction_hash as "transactionHash", event_key as "eventKey",
-  amount_base_units::text as "amountBaseUnits", from_address as "fromAddress", invoice_id::text as "invoiceId", method, observed_at::text as "observedAt"`;
+  amount_base_units::text as "amountBaseUnits", from_address as "fromAddress", invoice_id::text as "invoiceId", method, to_char(observed_at at time zone 'utc', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as "observedAt"`;
 const reconciliationColumns = `treasury_account_id::text as "treasuryAccountId", asset_id as "assetId", chain_balance_base_units::text as "chainBalanceBaseUnits",
   ledger_balance_base_units::text as "ledgerBalanceBaseUnits", pending_outbound_base_units::text as "pendingOutboundBaseUnits", difference_base_units::text as "differenceBaseUnits",
-  status, note, created_at::text as "createdAt"`;
+  status, note, to_char(created_at at time zone 'utc', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as "createdAt"`;
 
 async function audit(tx: Db, organizationId: string, actorPrincipalId: string | null, action: string, resourceType: string, resourceId: string, data: Record<string, unknown>): Promise<void> {
   await tx`
@@ -263,13 +263,14 @@ export class OperationsStore {
       const due = await tx<(ScheduleRecord & { destination: string; network: string; beneficiaryStatus: string; latestDue: number })[]>`
         select s.id::text, s.organization_id::text as "organizationId", s.treasury_account_id::text as "treasuryAccountId", s.beneficiary_id::text as "beneficiaryId",
           s.requester_principal_id::text as "requesterPrincipalId", s.asset_id as "assetId", s.amount_base_units::text as "amountBaseUnits", s.purpose,
-          s.interval_unit as "intervalUnit", s.interval_count as "intervalCount", s.start_at::text as "startAt", s.end_at::text as "endAt",
-          s.max_occurrences as "maxOccurrences", s.next_run_at::text as "nextRunAt", s.occurrences_created as "occurrencesCreated", s.status,
+          s.interval_unit as "intervalUnit", s.interval_count as "intervalCount", to_char(s.start_at at time zone 'utc', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as "startAt", to_char(s.end_at at time zone 'utc', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as "endAt",
+          s.max_occurrences as "maxOccurrences", to_char(s.next_run_at at time zone 'utc', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as "nextRunAt", s.occurrences_created as "occurrencesCreated", s.status,
           b.address as destination, t.network, b.status as "beneficiaryStatus",
           (select count(*)::int from generate_series(0, 10000) n
             where s.start_at + ((s.interval_count * n)::text || ' ' || s.interval_unit)::interval <= now()) as "latestDue"
         from payment_schedules s join beneficiaries b on b.id = s.beneficiary_id join treasury_accounts t on t.id = s.treasury_account_id
-        where s.status = 'active' and s.next_run_at <= now()
+          join organizations o on o.id = s.organization_id
+        where s.status = 'active' and s.next_run_at <= now() and not o.frozen
         order by s.next_run_at
         for update of s skip locked
         limit ${limit}
@@ -586,7 +587,7 @@ export class OperationsStore {
     if (!asset?.treasuryOk) return null;
     const opening = await ledgerNet(this.sql, input.treasuryAccountId, "treasury_asset", input.assetId, input.from);
     const entries = await this.sql<{ effectiveAt: string; description: string; reference: string | null; intentId: string | null; direction: "debit" | "credit"; amount: string; counterCodes: string[] }[]>`
-      select lt.effective_at::text as "effectiveAt", lt.description, lt.external_reference as reference, lt.intent_id::text as "intentId", le.direction, le.amount_base_units::text as amount,
+      select to_char(lt.effective_at at time zone 'utc', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as "effectiveAt", lt.description, lt.external_reference as reference, lt.intent_id::text as "intentId", le.direction, le.amount_base_units::text as amount,
         array(select la2.code from ledger_entries le2 join ledger_accounts la2 on la2.id = le2.account_id where le2.transaction_id = lt.id and le2.id <> le.id) as "counterCodes"
       from ledger_entries le
       join ledger_accounts la on la.id = le.account_id

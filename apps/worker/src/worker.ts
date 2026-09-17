@@ -65,7 +65,7 @@ export interface WorkerOptions {
 
 export interface SyncResult {
   treasuryId: string;
-  assets: { assetId: string; opened: boolean; inflows: number; reconciliation: string | null }[];
+  assets: { assetId: string; opened: boolean; inflows: number; reconciliation: string | null; error: string | null }[];
 }
 
 export interface WorkerHooks {
@@ -593,8 +593,9 @@ export class DurableWorker {
     const result: SyncResult = { treasuryId, assets: [] };
     for (const asset of target.assets) {
       const resolved = resolvedAsset({ id: asset.id, kind: asset.kind, address: asset.address, decimals: asset.decimals });
-      const entry = { assetId: asset.id, opened: false, inflows: 0, reconciliation: null as string | null };
+      const entry = { assetId: asset.id, opened: false, inflows: 0, reconciliation: null as string | null, error: null as string | null };
       result.assets.push(entry);
+      try {
       const cursor = await this.operations.getCursor(treasuryId, asset.id);
       const record = async (inflows: Awaited<ReturnType<SolanaAdapter["scanInflows"]>>["inflows"]) => {
         for (const inflow of inflows) {
@@ -638,6 +639,11 @@ export class DurableWorker {
       if ((await solana.newestSignature(watched)) !== newest) { entry.reconciliation = "moving"; continue; }
       const reconciliation = await this.operations.recordReconciliation({ organizationId: target.organizationId, treasuryId, assetId: asset.id, chainBalanceBaseUnits: balance });
       entry.reconciliation = reconciliation.status;
+      } catch (error) {
+        // One unreadable asset (a token that is not a contract on this chain, an
+        // RPC hiccup) must not stop the treasury's other assets from syncing.
+        entry.error = error instanceof Error ? error.message.split("\n")[0]! : "Sync failed";
+      }
     }
     return result;
   }

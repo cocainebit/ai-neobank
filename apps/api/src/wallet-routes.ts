@@ -13,6 +13,8 @@ export interface WalletRouteContext {
   environment: "development" | "test" | "production";
   human(request: FastifyRequest, reply: FastifyReply, roles?: PrincipalRole[]): HumanContext | null;
   evm: { adapter: EvmAdapter; rpcUrl: string; chainId: number } | null;
+  /** Reads a registered asset, so the local faucet can hand out test tokens. */
+  asset(assetId: string): Promise<{ id: string; kind: string; address: string | null; decimals: number } | null>;
   solana: { adapter: SolanaAdapter; rpcUrl: string; network: string } | null;
 }
 
@@ -60,7 +62,7 @@ export function registerWalletRoutes(app: FastifyInstance, context: WalletRouteC
   app.post("/v1/dev/fund", async (request, reply) => {
     const auth = context.human(request, reply); if (!auth) return;
     if (context.environment !== "development") return reply.code(404).send({ error: "not_found" });
-    const body = z.object({ chainFamily: z.enum(["evm", "svm"]), address: z.string().min(20) }).safeParse(request.body);
+    const body = z.object({ chainFamily: z.enum(["evm", "svm"]), address: z.string().min(20), assetId: z.string().min(1).optional() }).safeParse(request.body);
     if (!body.success) return reply.code(400).send({ error: "invalid_request" });
     let address: string;
     try { address = canonicalAddress(body.data.chainFamily, body.data.address); } catch { return reply.code(400).send({ error: "invalid_address" }); }
@@ -75,6 +77,15 @@ export function registerWalletRoutes(app: FastifyInstance, context: WalletRouteC
       };
       try {
         const [funder] = await rpc("eth_accounts", []) as string[];
+        if (body.data.assetId) {
+          const asset = await context.asset(body.data.assetId);
+          if (!asset || asset.kind !== "erc20" || !asset.address) return reply.code(422).send({ error: "asset_not_fundable" });
+          // transfer(address,uint256) of 1,000 whole tokens from the local faucet account.
+          const amount = 1000n * 10n ** BigInt(asset.decimals);
+          const data = `0xa9059cbb${address.slice(2).toLowerCase().padStart(64, "0")}${amount.toString(16).padStart(64, "0")}`;
+          const hash = await rpc("eth_sendTransaction", [{ from: funder, to: asset.address, data }]) as string;
+          return { data: { chainFamily: "evm", address, assetId: asset.id, transactionHash: hash } };
+        }
         const hash = await rpc("eth_sendTransaction", [{ from: funder, to: address, value: `0x${(10n * 10n ** 18n).toString(16)}` }]) as string;
         return { data: { chainFamily: "evm", address, transactionHash: hash } };
       } catch (error) {

@@ -75,7 +75,7 @@ up() {
     if curl -sf -m 2 "http://127.0.0.1:$SOL_RPC" -X POST -H 'content-type: application/json' \
       -d '{"jsonrpc":"2.0","id":1,"method":"getHealth"}' | grep -q '"ok"'; then
       echo "validator healthy"
-      (cd "$ROOT" && EVM_RPC_URL="http://127.0.0.1:$ANVIL_PORT" pnpm --silent --filter @ai-neobank/worker exec tsx src/deploy-safe-local.ts) || echo "Safe fixture deployment failed; Safe treasuries will be unavailable locally" >&2
+      (cd "$ROOT" && EVM_RPC_URL="http://127.0.0.1:$ANVIL_PORT" pnpm --silent --filter @ai-neobank/worker exec tsx src/deploy-local-fixtures.ts) || echo "Local fixture deployment failed; Safe treasuries and the test token will be unavailable locally" >&2
       status; return
     fi
     sleep 2

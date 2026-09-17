@@ -248,19 +248,19 @@ export interface CreateAgentInput {
   ownerPrincipalId?: string;
 }
 
-const organizationColumns = `id::text, name, slug, environment, frozen, autonomous_execution as "autonomousExecution", created_at::text as "createdAt"`;
+const organizationColumns = `id::text, name, slug, environment, frozen, autonomous_execution as "autonomousExecution", to_char(created_at at time zone 'utc', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as "createdAt"`;
 const principalColumns = `id::text, organization_id::text as "organizationId", type, display_name as "displayName", role, status`;
-const walletColumns = `id::text, organization_id::text as "organizationId", principal_id::text as "principalId", chain_family as "chainFamily", address, verified_at::text as "verifiedAt"`;
-const treasuryColumns = `id::text, organization_id::text as "organizationId", name, chain_family as "chainFamily", network, address, governance, status, executor_signer_id::text as "executorSignerId", observed_configuration as "observedConfiguration", created_at::text as "createdAt"`;
-const signerColumns = `id::text, organization_id::text as "organizationId", agent_id::text as "agentId", chain_family as "chainFamily", address, custody, status, created_at::text as "createdAt"`;
+const walletColumns = `id::text, organization_id::text as "organizationId", principal_id::text as "principalId", chain_family as "chainFamily", address, to_char(verified_at at time zone 'utc', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as "verifiedAt"`;
+const treasuryColumns = `id::text, organization_id::text as "organizationId", name, chain_family as "chainFamily", network, address, governance, status, executor_signer_id::text as "executorSignerId", observed_configuration as "observedConfiguration", to_char(created_at at time zone 'utc', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as "createdAt"`;
+const signerColumns = `id::text, organization_id::text as "organizationId", agent_id::text as "agentId", chain_family as "chainFamily", address, custody, status, to_char(created_at at time zone 'utc', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as "createdAt"`;
 const agentColumns = `a.id::text, a.organization_id::text as "organizationId", a.principal_id::text as "principalId", p.display_name as "displayName", a.purpose, a.status, a.capability_version as "capabilityVersion", a.owner_principal_id::text as "ownerPrincipalId"`;
-const credentialColumns = `id::text, organization_id::text as "organizationId", agent_id::text as "agentId", key_id as "keyId", label, status, created_at::text as "createdAt", last_used_at::text as "lastUsedAt"`;
-const policyVersionColumns = `id::text, policy_id::text as "policyId", organization_id::text as "organizationId", version, definition, definition_hash as "definitionHash", status, created_at::text as "createdAt"`;
+const credentialColumns = `id::text, organization_id::text as "organizationId", agent_id::text as "agentId", key_id as "keyId", label, status, to_char(created_at at time zone 'utc', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as "createdAt", to_char(last_used_at at time zone 'utc', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as "lastUsedAt"`;
+const policyVersionColumns = `id::text, policy_id::text as "policyId", organization_id::text as "organizationId", version, definition, definition_hash as "definitionHash", status, to_char(created_at at time zone 'utc', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as "createdAt"`;
 const assetColumns = `id, network, chain_family as "chainFamily", kind, address, symbol, decimals`;
 const intentColumns = `id::text, idempotency_key as "idempotencyKey", organization_id::text as "organizationId",
   treasury_account_id::text as "treasuryAccountId", requester_principal_id::text as "requesterId",
   network, asset_id as "assetId", amount_base_units::text as "amountBaseUnits", destination,
-  purpose, expires_at::text as "expiresAt", kind, status, version, created_at::text as "createdAt",
+  purpose, to_char(expires_at at time zone 'utc', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as "expiresAt", kind, status, version, to_char(created_at at time zone 'utc', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as "createdAt",
   policy_version_id::text as "policyVersionId", policy_decision as "policyDecision", failure_reason as "failureReason"`;
 
 export class PostgresControlPlaneStore {
@@ -293,7 +293,7 @@ export class PostgresControlPlaneStore {
           autonomous_execution = coalesce(${input.autonomousExecution ?? null}, autonomous_execution),
           updated_at = now()
         where id = ${id}
-        returning id::text, name, slug, environment, frozen, autonomous_execution as "autonomousExecution", created_at::text as "createdAt"
+        returning id::text, name, slug, environment, frozen, autonomous_execution as "autonomousExecution", to_char(created_at at time zone 'utc', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as "createdAt"
       `;
       if (!rows[0]) return null;
       await this.audit(tx, id, actorPrincipalId, "organization.updated", "organization", id, input);
@@ -306,7 +306,7 @@ export class PostgresControlPlaneStore {
   async findMemberships(chainFamily: "evm" | "svm", address: string): Promise<MembershipRecord[]> {
     return this.sql<MembershipRecord[]>`
       select w.id::text as "walletId", o.id::text as "organizationId", o.name as "organizationName", o.slug as "organizationSlug",
-        p.id::text as "principalId", p.display_name as "displayName", p.role, p.status as "principalStatus", w.verified_at::text as "verifiedAt"
+        p.id::text as "principalId", p.display_name as "displayName", p.role, p.status as "principalStatus", to_char(w.verified_at at time zone 'utc', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as "verifiedAt"
       from human_wallets w
       join principals p on p.id = w.principal_id
       join organizations o on o.id = w.organization_id
@@ -331,7 +331,7 @@ export class PostgresControlPlaneStore {
       const wallets = await tx<{ id: string; verifiedAt: string }[]>`
         insert into human_wallets (organization_id, principal_id, chain_family, address, verified_at)
         values (${organization.id}, ${principal.id}, ${input.chainFamily}, ${input.address}, now())
-        returning id::text, verified_at::text as "verifiedAt"
+        returning id::text, to_char(verified_at at time zone 'utc', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as "verifiedAt"
       `;
       const wallet = wallets[0];
       if (!wallet) throw new Error("Wallet insert returned no row");
@@ -351,7 +351,7 @@ export class PostgresControlPlaneStore {
       const wallets = await tx<WalletRecord[]>`
         insert into human_wallets (organization_id, principal_id, chain_family, address)
         values (${organizationId}, ${principal.id}, ${input.wallet.chainFamily}, ${input.wallet.address})
-        returning id::text, organization_id::text as "organizationId", principal_id::text as "principalId", chain_family as "chainFamily", address, verified_at::text as "verifiedAt"
+        returning id::text, organization_id::text as "organizationId", principal_id::text as "principalId", chain_family as "chainFamily", address, to_char(verified_at at time zone 'utc', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as "verifiedAt"
       `;
       await this.audit(tx, organizationId, actorPrincipalId, "member.added", "principal", principal.id, { role: input.role, wallet: input.wallet });
       return { ...principal, wallets: wallets };
@@ -389,7 +389,7 @@ export class PostgresControlPlaneStore {
     const rows = await this.sql<ChallengeRecord[]>`
       update auth_challenges set consumed_at = now()
       where nonce = ${nonce} and consumed_at is null and expires_at > now()
-      returning nonce, chain_family as "chainFamily", address, domain, message, expires_at::text as "expiresAt"
+      returning nonce, chain_family as "chainFamily", address, domain, message, to_char(expires_at at time zone 'utc', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as "expiresAt"
     `;
     return rows[0] ?? null;
   }
@@ -415,7 +415,7 @@ export class PostgresControlPlaneStore {
       where s.token_hash = ${tokenHash} and s.revoked_at is null and s.expires_at > now()
         and p.id = s.principal_id and o.id = s.organization_id
       returning s.id::text as "sessionId", s.organization_id::text as "organizationId", s.principal_id::text as "principalId",
-        s.wallet_id::text as "walletId", p.role, p.status as "principalStatus", o.frozen as "organizationFrozen", s.expires_at::text as "expiresAt"
+        s.wallet_id::text as "walletId", p.role, p.status as "principalStatus", o.frozen as "organizationFrozen", to_char(s.expires_at at time zone 'utc', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as "expiresAt"
     `;
     return rows[0] ?? null;
   }
@@ -506,7 +506,7 @@ export class PostgresControlPlaneStore {
   async findAgentCredential(keyId: string): Promise<AgentAuthRecord | null> {
     const rows = await this.sql<AgentAuthRecord[]>`
       select c.id::text, c.organization_id::text as "organizationId", c.agent_id::text as "agentId", c.key_id as "keyId", c.label, c.status,
-        c.created_at::text as "createdAt", c.last_used_at::text as "lastUsedAt", c.secret_hash as "secretHash",
+        to_char(c.created_at at time zone 'utc', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as "createdAt", to_char(c.last_used_at at time zone 'utc', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as "lastUsedAt", c.secret_hash as "secretHash",
         a.principal_id::text as "principalId", a.status as "agentStatus", o.frozen as "organizationFrozen"
       from agent_credentials c join agents a on a.id = c.agent_id join organizations o on o.id = c.organization_id
       where c.key_id = ${keyId}
@@ -525,7 +525,7 @@ export class PostgresControlPlaneStore {
       const rows = await tx<TreasuryRecord[]>`
         insert into treasury_accounts (organization_id, name, chain_family, network, address, governance, status, executor_signer_id, observed_configuration)
         values (${organizationId}, ${input.name}, ${input.chainFamily}, ${input.network}, ${input.address}, ${input.governance}, 'active', ${input.executorSignerId ?? null}, ${tx.json((input.observedConfiguration ?? {}) as never)})
-        returning id::text, organization_id::text as "organizationId", name, chain_family as "chainFamily", network, address, governance, status, executor_signer_id::text as "executorSignerId", observed_configuration as "observedConfiguration", created_at::text as "createdAt"
+        returning id::text, organization_id::text as "organizationId", name, chain_family as "chainFamily", network, address, governance, status, executor_signer_id::text as "executorSignerId", observed_configuration as "observedConfiguration", to_char(created_at at time zone 'utc', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as "createdAt"
       `;
       if (!rows[0]) throw new Error("Treasury insert returned no row");
       await this.audit(tx, organizationId, actorPrincipalId ?? null, "treasury.created", "treasury", rows[0].id, { network: input.network, address: input.address, governance: input.governance, executorSignerId: input.executorSignerId ?? null, observedConfiguration: input.observedConfiguration ?? {} });
@@ -683,7 +683,7 @@ export class PostgresControlPlaneStore {
 
   private async readPolicies(tx: Db, organizationId: string, policyId?: string): Promise<PolicyRecord[]> {
     const policies = await tx<{ id: string; organizationId: string; name: string; createdAt: string }[]>`
-      select id::text, organization_id::text as "organizationId", name, created_at::text as "createdAt" from policies
+      select id::text, organization_id::text as "organizationId", name, to_char(created_at at time zone 'utc', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as "createdAt" from policies
       where organization_id = ${organizationId} and (${policyId ?? null}::uuid is null or id = ${policyId ?? null}) order by created_at
     `;
     const versions = await tx.unsafe<PolicyVersionRecord[]>(`select ${policyVersionColumns} from policy_versions where organization_id = $1 and status = 'active'`, [organizationId]);
@@ -791,12 +791,12 @@ export class PostgresControlPlaneStore {
     const intent = rows[0];
     if (!intent) return null;
     const events = await this.sql<IntentEventRecord[]>`
-      select sequence, event_type as "eventType", actor_principal_id::text as "actorPrincipalId", data, created_at::text as "createdAt"
+      select sequence, event_type as "eventType", actor_principal_id::text as "actorPrincipalId", data, to_char(created_at at time zone 'utc', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as "createdAt"
       from intent_events where intent_id = ${intentId} order by sequence
     `;
     const executions = await this.sql<ExecutionRecord[]>`
       select id::text, status, transaction_hash as "transactionHash", block_cursor as "blockCursor", fee_base_units::text as "feeBaseUnits",
-        confirmations, error, observed, updated_at::text as "updatedAt"
+        confirmations, error, observed, to_char(updated_at at time zone 'utc', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as "updatedAt"
       from executions where intent_id = ${intentId}
     `;
     return { intent, events, approval: await this.getApprovalRequest(organizationId, intentId), execution: executions[0] ?? null };
@@ -807,7 +807,7 @@ export class PostgresControlPlaneStore {
       select ar.intent_id::text as "intentId", ar.required_approvals as "requiredApprovals",
         count(a.id) filter (where a.decision = 'approved')::int as approvals,
         ar.compiled_hash as "compiledHash", ar.simulation_hash as "simulationHash",
-        ar.status, ar.expires_at::text as "expiresAt", ar.external_ref as "externalRef"
+        ar.status, to_char(ar.expires_at at time zone 'utc', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as "expiresAt", ar.external_ref as "externalRef"
       from approval_requests ar left join approvals a on a.intent_id = ar.intent_id
       where ar.organization_id = ${organizationId} and ar.intent_id = ${intentId}
       group by ar.id
@@ -815,7 +815,7 @@ export class PostgresControlPlaneStore {
     const request = rows[0];
     if (!request) return null;
     const decisions = await this.sql<{ principalId: string | null; signerAddress: string | null; decision: string; createdAt: string }[]>`
-      select approver_principal_id::text as "principalId", signer_address as "signerAddress", decision, created_at::text as "createdAt" from approvals where intent_id = ${intentId} order by created_at
+      select approver_principal_id::text as "principalId", signer_address as "signerAddress", decision, to_char(created_at at time zone 'utc', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as "createdAt" from approvals where intent_id = ${intentId} order by created_at
     `;
     return { ...request, decisions };
   }
@@ -830,7 +830,7 @@ export class PostgresControlPlaneStore {
       if (!principal) throw new ApprovalError("not_found");
       if (principal.type !== "human" || principal.status !== "active" || !["owner", "approver"].includes(principal.role)) throw new ApprovalError("not_eligible");
       const rows = await tx<{ status: string; version: number; expiresAt: string; requestStatus: string; requiredApprovals: number; compiledHash: string | null; simulationHash: string | null; organizationFrozen: boolean; treasuryStatus: string; requesterStatus: string }[]>`
-        select i.status, i.version, i.expires_at::text as "expiresAt", ar.status as "requestStatus",
+        select i.status, i.version, to_char(i.expires_at at time zone 'utc', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as "expiresAt", ar.status as "requestStatus",
           ar.required_approvals as "requiredApprovals", ar.compiled_hash as "compiledHash", ar.simulation_hash as "simulationHash",
           o.frozen as "organizationFrozen", t.status as "treasuryStatus", rp.status as "requesterStatus"
         from intents i
@@ -889,7 +889,7 @@ export class PostgresControlPlaneStore {
   listLedgerEntries(organizationId: string, filter: { treasuryAccountId?: string; limit?: number } = {}): Promise<LedgerEntryRecord[]> {
     return this.sql<LedgerEntryRecord[]>`
       select lt.id::text as "transactionId", lt.intent_id::text as "intentId", lt.external_reference as "externalReference", lt.description,
-        lt.effective_at::text as "effectiveAt", la.treasury_account_id::text as "treasuryAccountId", la.code as "accountCode", la.asset_id as "assetId",
+        to_char(lt.effective_at at time zone 'utc', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as "effectiveAt", la.treasury_account_id::text as "treasuryAccountId", la.code as "accountCode", la.asset_id as "assetId",
         le.direction, le.amount_base_units::text as "amountBaseUnits"
       from ledger_entries le
       join ledger_transactions lt on lt.id = le.transaction_id
@@ -913,7 +913,7 @@ export class PostgresControlPlaneStore {
 
   listAuditEvents(organizationId: string, limit = 200): Promise<AuditEventRecord[]> {
     return this.sql<AuditEventRecord[]>`
-      select id::text, actor_principal_id::text as "actorPrincipalId", action, resource_type as "resourceType", resource_id as "resourceId", data, created_at::text as "createdAt"
+      select id::text, actor_principal_id::text as "actorPrincipalId", action, resource_type as "resourceType", resource_id as "resourceId", data, to_char(created_at at time zone 'utc', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as "createdAt"
       from audit_events where organization_id = ${organizationId} order by created_at desc limit ${limit}
     `;
   }

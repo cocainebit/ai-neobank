@@ -286,3 +286,12 @@ table.data tbody tr.clickable:hover { background: var(--panel-2); }
   .kv { grid-template-columns: minmax(0, 1fr); gap: 2px 0; }
   .kv dd { margin-bottom: 10px; }
 }
+
+/* Numbered steps */
+.steps { margin: 0; padding: 0; list-style: none; counter-reset: step; display: grid; gap: 0; border: 1px solid var(--line-soft); border-radius: 10px; overflow: hidden; }
+.steps li { counter-increment: step; display: grid; grid-template-columns: 26px minmax(0, 1fr); column-gap: 12px; padding: 12px 14px; font-size: 13.5px; }
+.steps li + li { border-top: 1px solid var(--line-soft); }
+.steps li::before { content: counter(step); grid-row: span 2; width: 22px; height: 22px; border-radius: 50%; display: grid; place-items: center; background: var(--panel-3); color: var(--dim); font-size: 12px; font-weight: 600; }
+.steps b { font-weight: 550; }
+.steps span { color: var(--faint); font-size: 13px; }
+.steps a { color: var(--text); text-decoration: underline; text-underline-offset: 2px; }

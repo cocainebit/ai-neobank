@@ -1,6 +1,6 @@
 import { createWorker } from "./worker.js";
 import { keyConfigurationFromEnv } from "@ai-neobank/signer";
-import { existsSync, readFileSync } from "node:fs";
+import { readLocalSafeContracts } from "./local-fixtures.js";
 
 const env = process.env;
 const databaseUrl = env.DATABASE_URL;
@@ -9,7 +9,7 @@ const pollMs = Number(env.WORKER_POLL_MS ?? 500);
 const keyConfiguration = await keyConfigurationFromEnv(env);
 console.log(`Signer keys: ${keyConfiguration.description}`);
 const evmChainId = env.EVM_CHAIN_ID ? Number(env.EVM_CHAIN_ID) : undefined;
-const safeContracts = env.SAFE_CONTRACTS_FILE && existsSync(env.SAFE_CONTRACTS_FILE) ? JSON.parse(readFileSync(env.SAFE_CONTRACTS_FILE, "utf8")) : undefined;
+const safeContracts = readLocalSafeContracts(env.LOCAL_FIXTURES_FILE);
 const chainConfig = keyConfiguration.keys || keyConfiguration.kms ? {
   ...(keyConfiguration.keys ? { keys: keyConfiguration.keys } : {}),
   ...(keyConfiguration.kms ? { kms: keyConfiguration.kms } : {}),

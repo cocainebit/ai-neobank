@@ -35,7 +35,7 @@ export interface RotationContext extends ExecutorRotationRecord {
 }
 
 const rotationColumns = `r.id::text, r.organization_id::text as "organizationId", r.treasury_account_id::text as "treasuryAccountId", r.from_signer_id::text as "fromSignerId",
-  r.to_signer_id::text as "toSignerId", r.status, r.external_ref as "externalRef", r.publication, r.failure_reason as "failureReason", r.created_at::text as "createdAt", r.updated_at::text as "updatedAt"`;
+  r.to_signer_id::text as "toSignerId", r.status, r.external_ref as "externalRef", r.publication, r.failure_reason as "failureReason", to_char(r.created_at at time zone 'utc', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as "createdAt", to_char(r.updated_at at time zone 'utc', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as "updatedAt"`;
 
 /** Intent states in which a treasury has proposals or transactions that a rotation would strand. */
 const inFlightStatuses = ["policy_evaluated", "approval_required", "approved", "executing", "submitted"];
@@ -73,7 +73,7 @@ export class RotationStore {
         insert into executor_rotations (organization_id, treasury_account_id, from_signer_id, to_signer_id, status, created_by)
         values (${organizationId}, ${treasuryId}, ${treasury.executorSignerId}, ${toSignerId}, ${status}, ${actorPrincipalId})
         returning id::text, organization_id::text as "organizationId", treasury_account_id::text as "treasuryAccountId", from_signer_id::text as "fromSignerId",
-          to_signer_id::text as "toSignerId", status, external_ref as "externalRef", publication, failure_reason as "failureReason", created_at::text as "createdAt", updated_at::text as "updatedAt"
+          to_signer_id::text as "toSignerId", status, external_ref as "externalRef", publication, failure_reason as "failureReason", to_char(created_at at time zone 'utc', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as "createdAt", to_char(updated_at at time zone 'utc', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as "updatedAt"
       `;
       const rotation = rows[0]!;
       if (status === "completed") {

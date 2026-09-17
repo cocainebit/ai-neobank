@@ -28,14 +28,23 @@ real simulation, and human approval decide what gets signed.
 - Native and token transfers (ERC-20 and SPL) on EVM and Solana direct
   treasuries whose keys are held as encrypted software signers (local
   development custody only).
-- Safe 2-of-3 deploy/sign/execute as a standalone adapter (not yet wired to
-  intents).
+- Safe treasuries: Relay prepares the deployment for the owner's wallet,
+  verifies owners and threshold on chain at registration, compiles the Safe
+  transaction at intake, collects EIP-712 owner signatures as approvals, and an
+  executor that is never an owner submits `execTransaction`. Quorum is the
+  Safe's threshold. A nonce that moved before execution fails the intent
+  instead of executing something else.
+- Squads v4 treasuries: the executor is a member with Initiate and Execute
+  only (registration refuses one that can vote). It publishes the vault
+  transaction and proposal; members vote on chain with transactions the API
+  builds for their wallets; the worker mirrors on-chain votes and executes once
+  the program marks the proposal approved.
 
 ## Not yet
 
-Squads governance, Safe wired into intents, x402, a frontend on the real API,
-invoicing/beneficiaries/recurring/statements, HSM/KMS signing, devnet runs, CI.
-The web app in `apps/web` is still the earlier fixture prototype.
+x402, a frontend on the real API, invoicing/beneficiaries/recurring/statements,
+HSM/KMS signing, devnet runs, CI. The web app in `apps/web` is still the earlier
+fixture prototype.
 
 ## Run it locally
 
@@ -63,8 +72,8 @@ execute, confirm), `apps/web` (Next.js prototype), `packages/auth` (sign-in and
 key material), `packages/database` (PostgreSQL store, migrations, job queue,
 ledger), `packages/domain` (schemas), `packages/policy` (pure policy engine),
 `packages/chain-core` (adapter interfaces), `packages/evm-adapter`,
-`packages/solana-adapter`, `packages/safe-adapter`, `packages/signer`
-(AES-256-GCM envelope for development keys).
+`packages/solana-adapter`, `packages/safe-adapter`, `packages/squads-adapter`,
+`packages/signer` (AES-256-GCM envelope for development keys).
 
 Design references: `docs/BACKEND-ARCHITECTURE.md`, `docs/THREAT-MODEL.md`,
 `docs/PRODUCT-SUITE.md`, `DESIGN.md`.

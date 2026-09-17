@@ -21,7 +21,10 @@ import {
 } from "@ai-neobank/auth";
 import { EvmAdapter } from "@ai-neobank/evm-adapter";
 import { SolanaAdapter } from "@ai-neobank/solana-adapter";
+import { SafeGovernanceAdapter, recoverSafeSigner, safeTypedDataJson, type CompiledSafeTransaction, type SafeContractAddresses } from "@ai-neobank/safe-adapter";
+import { SquadsGovernanceAdapter } from "@ai-neobank/squads-adapter";
 import type { ResolvedAsset } from "@ai-neobank/chain-core";
+import { PublicKey, TransactionMessage, VersionedTransaction } from "@solana/web3.js";
 import { z } from "zod";
 
 export interface AppOptions {
@@ -34,7 +37,7 @@ export interface AppOptions {
   signerMasterKey?: Uint8Array;
   allowSoftwareSigners?: boolean;
   chains?: {
-    evm?: { network: `eip155:${number}`; chainId: number; rpcUrl: string; confirmations?: number };
+    evm?: { network: `eip155:${number}`; chainId: number; rpcUrl: string; confirmations?: number; safeContracts?: SafeContractAddresses };
     solana?: { network: `solana:${string}`; rpcUrl: string; finality?: "confirmed" | "finalized" };
   };
   logger?: boolean;
@@ -70,14 +73,27 @@ const treasurySchema = z.object({
   chainFamily,
   network: z.string().regex(/^[a-z0-9]+:[a-zA-Z0-9-]+$/),
   address: z.string().min(20),
-  governance: z.enum(["safe", "squads", "direct"])
+  governance: z.enum(["safe", "squads", "direct"]),
+  /** Required for Safe and Squads: the organisation's signer that submits approved transactions. */
+  executorSignerId: uuid.optional(),
+  /** Squads only: the multisig account whose vault 0 is the treasury address. */
+  multisigPda: z.string().min(32).optional()
 }).superRefine((value, context) => {
+  if (value.governance !== "direct" && !value.executorSignerId) context.addIssue({ code: "custom", message: "Governed treasuries need an executorSignerId" });
+  if (value.governance === "squads" && !value.multisigPda) context.addIssue({ code: "custom", message: "Squads treasuries need the multisigPda" });
   if (value.chainFamily === "evm" && !value.network.startsWith("eip155:")) context.addIssue({ code: "custom", message: "EVM treasury requires an eip155 network" });
   if (value.chainFamily === "svm" && !value.network.startsWith("solana:")) context.addIssue({ code: "custom", message: "Solana treasury requires a solana network" });
   if (value.chainFamily === "evm" && value.governance === "squads") context.addIssue({ code: "custom", message: "Squads is only valid for Solana" });
   if (value.chainFamily === "svm" && value.governance === "safe") context.addIssue({ code: "custom", message: "Safe is only valid for EVM" });
 });
 const treasuryStatusSchema = z.object({ status: z.enum(["active", "frozen"]) });
+const prepareTreasurySchema = z.object({
+  governance: z.enum(["safe", "squads"]),
+  network: z.string().regex(/^[a-z0-9]+:[a-zA-Z0-9-]+$/),
+  owners: z.array(z.string().min(20)).min(1).max(20),
+  threshold: z.number().int().min(1).max(20),
+  executorSignerId: uuid
+});
 const assetSchema = z.object({ network: z.string().regex(/^[a-z0-9]+:[a-zA-Z0-9-]+$/), kind: z.enum(["erc20", "spl"]), address: z.string().min(20), symbol: z.string().min(1).max(16) });
 const signerSchema = z.object({ chainFamily, agentId: uuid.optional(), revealDevelopmentSecret: z.boolean().default(false) });
 const signerStatusSchema = z.object({ status: z.enum(["active", "frozen", "revoked"]) });
@@ -97,6 +113,7 @@ const decisionSchema = z.object({
   simulationHash: z.string().regex(/^[a-f0-9]{64}$/),
   signature: z.string().min(16).max(8192).optional()
 });
+const onChainVoteSchema = z.object({ transactionSignature: z.string().min(32).max(128).optional() });
 const evaluateSchema = z.object({ intent: paymentIntentSchema, policy: spendingPolicySchema, spentTodayBaseUnits: z.string().regex(/^\d+$/) });
 
 function invalid(reply: FastifyReply, details: unknown) {
@@ -115,6 +132,8 @@ export function buildApp(options: AppOptions) {
 
   const evmAdapter = options.chains?.evm ? new EvmAdapter(options.chains.evm) : null;
   const solanaAdapter = options.chains?.solana ? new SolanaAdapter(options.chains.solana) : null;
+  const safeAdapter = options.chains?.evm ? new SafeGovernanceAdapter({ rpcUrl: options.chains.evm.rpcUrl, chainId: options.chains.evm.chainId, ...(options.chains.evm.safeContracts ? { contracts: options.chains.evm.safeContracts } : {}) }) : null;
+  const squadsAdapter = solanaAdapter ? new SquadsGovernanceAdapter(solanaAdapter) : null;
   const adapterFor = (family: "evm" | "svm", network: string) => {
     const adapter = family === "evm" ? evmAdapter : solanaAdapter;
     if (!adapter || adapter.network !== network) return null;
@@ -201,8 +220,8 @@ export function buildApp(options: AppOptions) {
         evm: evmHealth,
         solana: solanaHealth,
         directExecution: "e2e_local",
-        safe: "adapter_standalone_not_wired",
-        squads: "not_implemented",
+        safe: safeAdapter ? "e2e_local" : "not_configured",
+        squads: squadsAdapter ? "e2e_local" : "not_configured",
         x402: "not_implemented",
         softwareSigners: options.allowSoftwareSigners && options.signerMasterKey ? "enabled_development_only" : "disabled"
       }
@@ -426,9 +445,60 @@ export function buildApp(options: AppOptions) {
     if (!body.success) return invalid(reply, body.error.flatten());
     let address: string;
     try { address = canonicalAddress(body.data.chainFamily, body.data.address); } catch { return invalid(reply, "Invalid treasury address"); }
+    let observedConfiguration: Record<string, unknown> = {};
+    if (body.data.governance !== "direct") {
+      const signer = (await store.listSigners(auth.organizationId)).find((candidate) => candidate.id === body.data.executorSignerId);
+      if (!signer || signer.chainFamily !== body.data.chainFamily || signer.status !== "active") return reply.code(422).send({ error: "executor_signer_invalid" });
+      const members = await store.listMembers(auth.organizationId);
+      const myWallets = members.find((member) => member.id === auth.principalId)?.wallets.filter((wallet) => wallet.chainFamily === body.data.chainFamily).map((wallet) => wallet.address) ?? [];
+      if (body.data.governance === "safe") {
+        if (!safeAdapter || options.chains?.evm?.network !== body.data.network) return reply.code(503).send({ error: "network_not_configured", network: body.data.network });
+        let observed;
+        try { observed = await safeAdapter.observe(address); } catch { return reply.code(422).send({ error: "safe_not_found_on_chain" }); }
+        const owners = observed.owners.map((owner) => owner.toLowerCase());
+        if (!myWallets.some((wallet) => owners.includes(wallet.toLowerCase()))) return reply.code(403).send({ error: "registering_wallet_is_not_an_owner" });
+        if (owners.includes(signer.address.toLowerCase())) return reply.code(422).send({ error: "executor_must_not_be_an_owner" });
+        observedConfiguration = { owners: observed.owners, threshold: observed.threshold, modules: observed.modules, guard: observed.guard, observedAt: new Date().toISOString() };
+      } else {
+        if (!squadsAdapter || options.chains?.solana?.network !== body.data.network) return reply.code(503).send({ error: "network_not_configured", network: body.data.network });
+        let observed;
+        try { observed = await squadsAdapter.observe(body.data.multisigPda!); } catch { return reply.code(422).send({ error: "multisig_not_found_on_chain" }); }
+        if (observed.vaultPda !== address) return reply.code(422).send({ error: "address_is_not_vault_zero_of_multisig" });
+        if (!observed.members.some((member) => member.canVote && myWallets.includes(member.key))) return reply.code(403).send({ error: "registering_wallet_is_not_a_voting_member" });
+        const executorMember = observed.members.find((member) => member.key === signer.address);
+        if (!executorMember || !executorMember.canInitiate || !executorMember.canExecute) return reply.code(422).send({ error: "executor_needs_initiate_and_execute" });
+        if (executorMember.canVote) return reply.code(422).send({ error: "executor_must_not_vote" });
+        observedConfiguration = { multisigPda: body.data.multisigPda, threshold: observed.threshold, timeLock: observed.timeLock, members: observed.members, observedAt: new Date().toISOString() };
+      }
+    }
     await store.ensureNativeAsset(body.data.network, body.data.chainFamily);
-    const created = await store.createTreasury(auth.organizationId, { ...body.data, address }, auth.principalId);
+    const created = await store.createTreasury(auth.organizationId, { name: body.data.name, chainFamily: body.data.chainFamily, network: body.data.network, address, governance: body.data.governance, ...(body.data.executorSignerId ? { executorSignerId: body.data.executorSignerId } : {}), observedConfiguration }, auth.principalId);
     return reply.code(201).send({ data: created });
+  });
+
+  /** Deployment material for the owner's wallet to send: Relay never deploys or owns a treasury. */
+  app.post("/v1/treasuries/prepare", async (request, reply) => {
+    const auth = human(request, reply, ["owner"]); if (!auth) return;
+    const body = prepareTreasurySchema.safeParse(request.body);
+    if (!body.success) return invalid(reply, body.error.flatten());
+    const family = body.data.governance === "safe" ? "evm" : "svm";
+    const signer = (await store.listSigners(auth.organizationId)).find((candidate) => candidate.id === body.data.executorSignerId);
+    if (!signer || signer.chainFamily !== family) return reply.code(422).send({ error: "executor_signer_invalid" });
+    let owners: string[];
+    try { owners = body.data.owners.map((owner) => canonicalAddress(family, owner)); } catch { return invalid(reply, "Invalid owner address"); }
+    if (body.data.governance === "safe") {
+      if (!safeAdapter || options.chains?.evm?.network !== body.data.network) return reply.code(503).send({ error: "network_not_configured" });
+      const prepared = await safeAdapter.prepareDeployment(owners, body.data.threshold);
+      return { data: { governance: "safe", network: body.data.network, predictedAddress: prepared.address, transaction: { to: prepared.to, data: prepared.data, value: prepared.value }, saltNonce: prepared.saltNonce, owners, threshold: body.data.threshold, executor: signer.address } };
+    }
+    if (!squadsAdapter || !solanaAdapter || options.chains?.solana?.network !== body.data.network) return reply.code(503).send({ error: "network_not_configured" });
+    const creator = new PublicKey(owners[0]!);
+    const prepared = await squadsAdapter.prepareCreate(creator, [...owners.map((key) => ({ key, role: "owner" as const })), { key: signer.address, role: "executor" as const }], body.data.threshold);
+    const { blockhash } = await solanaAdapter.rpc.getLatestBlockhash("finalized");
+    const message = new TransactionMessage({ payerKey: creator, recentBlockhash: blockhash, instructions: [prepared.instruction] }).compileToV0Message();
+    const transaction = new VersionedTransaction(message);
+    transaction.sign([prepared.createKey]);
+    return { data: { governance: "squads", network: body.data.network, multisigPda: prepared.multisigPda, vaultPda: prepared.vaultPda, transactionBase64: Buffer.from(transaction.serialize()).toString("base64"), feePayer: creator.toBase58(), owners, threshold: body.data.threshold, executor: signer.address } };
   });
 
   app.patch<{ Params: { id: string } }>("/v1/treasuries/:id/status", async (request, reply) => {
@@ -578,28 +648,75 @@ export function buildApp(options: AppOptions) {
     if (!id.success || !decision.success) return invalid(reply, "Invalid intent ID or decision");
     const detail = await store.getIntent(auth.organizationId, id.data);
     if (!detail?.approval?.compiledHash || !detail.approval.simulationHash) return reply.code(404).send({ error: "approval_not_found" });
+    const treasury = await store.getTreasury(auth.organizationId, detail.intent.treasuryAccountId);
+    const base = { expectedIntentVersion: detail.intent.version, compiledHash: detail.approval.compiledHash, simulationHash: detail.approval.simulationHash };
+    const ref = detail.approval.externalRef as { kind?: string; safeTx?: CompiledSafeTransaction; safeAddress?: string; chainId?: number; multisigPda?: string; transactionIndex?: string; proposalPda?: string } | null;
+    if (treasury?.governance === "safe" && ref?.safeTx && ref.safeAddress) {
+      if (decision.data === "rejected") return { data: { kind: "plain", ...base, message: buildApprovalMessage({ domain: options.auth.domain, intentId: id.data, version: detail.intent.version, decision: "rejected", compiledHash: detail.approval.compiledHash, simulationHash: detail.approval.simulationHash }) } };
+      return { data: { kind: "eip712", ...base, safeTxHash: ref.safeTx.safeTxHash, typedData: safeTypedDataJson(ref.chainId ?? options.chains?.evm?.chainId ?? 1, ref.safeAddress, ref.safeTx) } };
+    }
+    if (treasury?.governance === "squads" && ref?.multisigPda && ref.transactionIndex && squadsAdapter && solanaAdapter) {
+      const members = await store.listMembers(auth.organizationId);
+      const wallet = members.find((member) => member.id === auth.principalId)?.wallets.find((candidate) => candidate.chainFamily === "svm");
+      if (!wallet) return reply.code(403).send({ error: "no_solana_wallet_bound" });
+      const instruction = squadsAdapter.voteInstruction(ref.multisigPda, BigInt(ref.transactionIndex), wallet.address, decision.data);
+      const { blockhash } = await solanaAdapter.rpc.getLatestBlockhash("finalized");
+      const message = new TransactionMessage({ payerKey: new PublicKey(wallet.address), recentBlockhash: blockhash, instructions: [instruction] }).compileToV0Message();
+      return { data: { kind: "solana_transaction", ...base, transactionBase64: Buffer.from(new VersionedTransaction(message).serialize()).toString("base64"), proposalPda: ref.proposalPda, member: wallet.address } };
+    }
     const message = buildApprovalMessage({ domain: options.auth.domain, intentId: id.data, version: detail.intent.version, decision: decision.data, compiledHash: detail.approval.compiledHash, simulationHash: detail.approval.simulationHash });
-    return { data: { message, expectedIntentVersion: detail.intent.version, compiledHash: detail.approval.compiledHash, simulationHash: detail.approval.simulationHash } };
+    return { data: { kind: "plain", ...base, message } };
   });
 
   for (const decision of ["approved", "rejected"] as const) {
     const path = decision === "approved" ? "/v1/intents/:id/approve" : "/v1/intents/:id/reject";
     app.post<{ Params: { id: string } }>(path, async (request, reply) => {
       const auth = human(request, reply, ["owner", "approver"]); if (!auth) return;
-      const body = decisionSchema.safeParse(request.body);
       const id = uuid.safeParse(request.params.id);
-      if (!body.success || !id.success) return invalid(reply, "Invalid approval request");
+      if (!id.success) return invalid(reply, "Invalid intent ID");
+      const detail = await store.getIntent(auth.organizationId, id.data);
+      if (!detail) return reply.code(404).send({ error: "intent_not_found" });
+      const treasury = await store.getTreasury(auth.organizationId, detail.intent.treasuryAccountId);
+      const members = await store.listMembers(auth.organizationId);
+      const wallet = members.find((member) => member.id === auth.principalId)?.wallets.find((candidate) => candidate.id === auth.walletId);
+
+      // Squads: the vote is the on-chain transaction the member already sent; the worker mirrors it.
+      if (treasury?.governance === "squads") {
+        const body = onChainVoteSchema.safeParse(request.body ?? {});
+        if (!body.success) return invalid(reply, body.error.flatten());
+        if (!queue) return reply.code(503).send({ error: "queue_not_configured" });
+        if (body.data.transactionSignature && solanaAdapter) {
+          const receipt = await solanaAdapter.waitForTransaction(body.data.transactionSignature).catch(() => null);
+          if (!receipt || receipt.failed) return reply.code(409).send({ error: "vote_transaction_not_confirmed" });
+        }
+        await queue.sql`insert into outbox_events (organization_id, topic, aggregate_type, aggregate_id, payload) values (${auth.organizationId}, 'proposal.observe', 'intent', ${id.data}, ${queue.sql.json({ intentId: id.data })})`;
+        return reply.code(202).send({ data: { intentId: id.data, source: "on_chain", approval: detail.approval } });
+      }
+
+      const body = decisionSchema.safeParse(request.body);
+      if (!body.success) return invalid(reply, body.error.flatten());
       let signedPayload: string | undefined;
-      if (body.data.signature) {
-        const members = await store.listMembers(auth.organizationId);
-        const wallet = members.find((member) => member.id === auth.principalId)?.wallets.find((candidate) => candidate.id === auth.walletId);
+      let signerAddress: string | undefined;
+      const ref = detail.approval?.externalRef as { safeTx?: CompiledSafeTransaction; owners?: string[] } | null;
+      if (treasury?.governance === "safe" && decision === "approved") {
+        // Safe: the approval is the owner's EIP-712 signature; it must come from this principal's wallet and that wallet must own the Safe.
+        if (!body.data.signature) return reply.code(400).send({ error: "owner_signature_required" });
+        if (!wallet || wallet.chainFamily !== "evm") return reply.code(403).send({ error: "no_wallet_bound" });
+        if (!ref?.safeTx || !ref.owners) return reply.code(409).send({ error: "safe_transaction_not_published" });
+        const recovered = await recoverSafeSigner(ref.safeTx.safeTxHash, body.data.signature).catch(() => null);
+        if (!recovered || recovered.toLowerCase() !== wallet.address.toLowerCase()) return reply.code(401).send({ error: "approval_signature_invalid" });
+        if (!ref.owners.map((owner) => owner.toLowerCase()).includes(recovered.toLowerCase())) return reply.code(403).send({ error: "wallet_is_not_a_safe_owner" });
+        signedPayload = body.data.signature;
+        signerAddress = recovered;
+      } else if (body.data.signature) {
         if (!wallet) return reply.code(403).send({ error: "no_wallet_bound" });
         const message = buildApprovalMessage({ domain: options.auth.domain, intentId: id.data, version: body.data.expectedIntentVersion, decision, compiledHash: body.data.compiledHash, simulationHash: body.data.simulationHash });
         if (!(await verifyWalletSignature({ chainFamily: wallet.chainFamily, address: wallet.address, message, signature: body.data.signature }))) return reply.code(401).send({ error: "approval_signature_invalid" });
         signedPayload = JSON.stringify({ chainFamily: wallet.chainFamily, address: wallet.address, message, signature: body.data.signature });
+        signerAddress = wallet.address;
       }
       try {
-        const result = await store.decideIntent(auth.organizationId, id.data, { principalId: auth.principalId, decision, expectedIntentVersion: body.data.expectedIntentVersion, compiledHash: body.data.compiledHash, simulationHash: body.data.simulationHash, ...(signedPayload ? { signedPayload } : {}) });
+        const result = await store.decideIntent(auth.organizationId, id.data, { principalId: auth.principalId, decision, expectedIntentVersion: body.data.expectedIntentVersion, compiledHash: body.data.compiledHash, simulationHash: body.data.simulationHash, ...(signedPayload ? { signedPayload } : {}), ...(signerAddress ? { signerAddress } : {}) });
         return reply.code(result.idempotentReplay ? 200 : 202).send({ data: result });
       } catch (error) {
         if (!(error instanceof ApprovalError)) throw error;

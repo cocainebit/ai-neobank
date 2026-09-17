@@ -35,18 +35,27 @@ importers:
       '@ai-neobank/policy':
         specifier: workspace:*
         version: link:../../packages/policy
+      '@ai-neobank/safe-adapter':
+        specifier: workspace:*
+        version: link:../../packages/safe-adapter
       '@ai-neobank/signer':
         specifier: workspace:*
         version: link:../../packages/signer
       '@ai-neobank/solana-adapter':
         specifier: workspace:*
         version: link:../../packages/solana-adapter
+      '@ai-neobank/squads-adapter':
+        specifier: workspace:*
+        version: link:../../packages/squads-adapter
       '@fastify/cookie':
         specifier: ^11.0.2
         version: 11.1.2
       '@fastify/cors':
         specifier: ^11.1.0
         version: 11.3.0
+      '@solana/web3.js':
+        specifier: ^1.98.4
+        version: 1.99.0(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@6.0.6)
       fastify:
         specifier: ^5.6.0
         version: 5.12.5
@@ -112,12 +121,18 @@ importers:
       '@ai-neobank/evm-adapter':
         specifier: workspace:*
         version: link:../../packages/evm-adapter
+      '@ai-neobank/safe-adapter':
+        specifier: workspace:*
+        version: link:../../packages/safe-adapter
       '@ai-neobank/signer':
         specifier: workspace:*
         version: link:../../packages/signer
       '@ai-neobank/solana-adapter':
         specifier: workspace:*
         version: link:../../packages/solana-adapter
+      '@ai-neobank/squads-adapter':
+        specifier: workspace:*
+        version: link:../../packages/squads-adapter
       '@solana/web3.js':
         specifier: ^1.98.4
         version: 1.99.0(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@6.0.6)
@@ -230,6 +245,9 @@ importers:
         specifier: ^2.37.3
         version: 2.56.5(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@6.0.6)(zod@4.6.5)
     devDependencies:
+      '@ai-neobank/evm-adapter':
+        specifier: workspace:*
+        version: link:../evm-adapter
       '@safe-global/safe-contracts':
         specifier: 1.4.1
         version: 1.4.1(ethers@5.4.0(bufferutil@4.1.0))
@@ -271,6 +289,31 @@ importers:
         specifier: ^5.0.0
         version: 5.0.0
     devDependencies:
+      vitest:
+        specifier: ^3.2.4
+        version: 3.2.7(@types/node@22.20.3)(tsx@4.23.13)
+
+  packages/squads-adapter:
+    dependencies:
+      '@ai-neobank/chain-core':
+        specifier: workspace:*
+        version: link:../chain-core
+      '@ai-neobank/solana-adapter':
+        specifier: workspace:*
+        version: link:../solana-adapter
+      '@solana/spl-token':
+        specifier: ^0.4.14
+        version: 0.4.15(@solana/web3.js@1.99.0(bufferutil@4.1.0)(typescript@5.9.3))(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)
+      '@solana/web3.js':
+        specifier: ^1.98.4
+        version: 1.99.0(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@6.0.6)
+      '@sqds/multisig':
+        specifier: 2.1.3
+        version: 2.1.3(bufferutil@4.1.0)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.3)
+    devDependencies:
+      '@types/node':
+        specifier: ^22.18.1
+        version: 22.20.3
       vitest:
         specifier: ^3.2.4
         version: 3.2.7(@types/node@22.20.3)(tsx@4.23.13)

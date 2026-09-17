@@ -23,8 +23,8 @@ API returns `200`. Each integration must pass its complete money-flow lifecycle.
 | Direct execution pipeline | e2e-local | Sign -> persist signed bytes and hash -> broadcast -> confirm at finality -> ledger (pending, settlement, fee) -> reconcile against observed destination delta, for native, ERC-20, SOL, and SPL. Crash injection between signing and broadcast: unsent transaction resent, already-sent transaction not sent twice, nonce reuse detected as dead |
 | EVM RPC | e2e-local | Anvil health, balances, gas and fee estimate, sign-before-broadcast, receipt with confirmation depth, destination delta from value or Transfer log. Still required: Base Sepolia, provider failover, reorg handling |
 | Solana RPC | e2e-local | Local validator health, balances, fee and simulation, sign-before-broadcast, `finalized` commitment, pre/post balance deltas for SOL and SPL, blockhash expiry detection. Still required: devnet, provider failover |
-| Safe Protocol | e2e-local (standalone) | 2-of-3 deploy, observe, hash, signature aggregation, execute on Anvil. Not wired into intents, approvals, or the ledger |
-| Squads Protocol v4 | researched | Program cloned into the local validator at genesis; no adapter yet |
+| Safe Protocol | e2e-local | Deployment prepared for the owner's wallet; registration verifies owners/threshold on chain and refuses non-owner registrants and owner executors; intent compiled to a Safe transaction at intake; EIP-712 owner signatures verified against the session wallet and the owner set; non-owner executor executes; threshold and replay enforced by the Safe; moved nonce fails the intent; native and ERC-20 (`packages/safe-adapter`, `apps/worker/src/governance.test.ts`, `apps/api/src/governance.test.ts`). Still required: Base Sepolia with canonical deployments, rejection transactions, Transaction Service interop |
+| Squads Protocol v4 | e2e-local | Real program bytes cloned from devnet; creation prepared for the member's wallet with a server-held create key; registration verifies vault, members, and that the executor has Initiate+Execute and no Vote; executor publishes vault transaction + proposal with the index recorded before broadcast; members vote with API-built transactions; on-chain votes mirrored to approvals; program-side threshold, executor vote refusal, premature execute refusal, and rejection proven; SOL and SPL (`packages/squads-adapter`, worker and API governance tests). Still required: devnet, time locks, spending limits, config changes |
 | x402 | researched | No implementation |
 | Encrypted software signer | contract-tested | Development custody only; refused in production and secret export refused outside development. Still required: KMS/HSM backend, key rotation |
 | PostgreSQL | e2e-local | Migrations 001-004, organisation-scoped composite foreign keys, transactional outbox, lease recovery for jobs left running by a crashed worker |
@@ -150,7 +150,8 @@ remain disabled until their proposal/approval/execution suites pass.
   SPL at finalized commitment), `apps/worker` (EVM native + ERC-20 to
   reconciled; two crash-injection recoveries; Solana SOL + SPL to reconciled),
   `apps/api` (wallet sign-in through execution over HTTP), `packages/safe-adapter`
-  (standalone 2-of-3).
-- Boundary: direct treasuries with development software signers only. Safe and
-  Squads governance are not yet on the intent path; nothing has run on a public
-  test network.
+  and `packages/squads-adapter` (governance primitives), worker and API
+  governance suites (Safe and Squads intents from agent submission to
+  reconciliation).
+- Boundary: executor keys are development software signers; nothing has run on
+  a public test network.

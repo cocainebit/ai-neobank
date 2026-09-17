@@ -16,7 +16,10 @@ import {
   PublicKey,
   SystemProgram,
   Transaction,
-  type Commitment
+  TransactionMessage,
+  VersionedTransaction,
+  type AddressLookupTableAccount,
+  type TransactionInstruction
 } from "@solana/web3.js";
 import {
   createAssociatedTokenAccountIdempotentInstruction,
@@ -133,6 +136,49 @@ export class SolanaAdapter implements ChainAdapter {
     };
   }
 
+  /**
+   * Signs a versioned transaction made of the given instructions, fee paid by
+   * `feePayer`, without sending. Used for Squads create/propose/execute.
+   */
+  async signInstructions(instructions: TransactionInstruction[], feePayer: Keypair, extraSigners: Keypair[] = [], lookupTables: AddressLookupTableAccount[] = []): Promise<SignedTransaction> {
+    const { blockhash, lastValidBlockHeight } = await this.connection.getLatestBlockhash("finalized");
+    const message = new TransactionMessage({ payerKey: feePayer.publicKey, recentBlockhash: blockhash, instructions }).compileToV0Message(lookupTables);
+    const transaction = new VersionedTransaction(message);
+    transaction.sign([feePayer, ...extraSigners]);
+    const signature = transaction.signatures[0];
+    if (!signature) throw new Error("Transaction was not signed");
+    return {
+      hash: bs58.encode(signature),
+      raw: Buffer.from(transaction.serialize()).toString("base64"),
+      nonce: blockhash,
+      validUntil: String(lastValidBlockHeight)
+    };
+  }
+
+  /** Simulates a versioned transaction of instructions; returns the fee and any program error. */
+  async simulateInstructions(instructions: TransactionInstruction[], feePayer: PublicKey, lookupTables: AddressLookupTableAccount[] = []): Promise<TransferSimulation> {
+    try {
+      const { blockhash } = await this.connection.getLatestBlockhash(this.commitment);
+      const message = new TransactionMessage({ payerKey: feePayer, recentBlockhash: blockhash, instructions }).compileToV0Message(lookupTables);
+      const transaction = new VersionedTransaction(message);
+      const [fee, simulation] = await Promise.all([
+        this.connection.getFeeForMessage(message, this.commitment),
+        this.connection.simulateTransaction(transaction, { sigVerify: false, replaceRecentBlockhash: true })
+      ]);
+      if (simulation.value.err) {
+        return { ok: false, feeBaseUnits: BigInt(fee.value ?? 0), error: `Simulation failed: ${JSON.stringify(simulation.value.err)} ${(simulation.value.logs ?? []).slice(-4).join(" | ")}` };
+      }
+      return { ok: fee.value !== null, feeBaseUnits: BigInt(fee.value ?? 0) };
+    } catch (error) {
+      return { ok: false, feeBaseUnits: 0n, error: error instanceof Error ? error.message : "Unknown simulation error" };
+    }
+  }
+
+  /** The raw connection, for adapters layered on top (Squads). */
+  get rpc(): Connection {
+    return this.connection;
+  }
+
   async broadcast(signed: SignedTransaction): Promise<SubmittedTransaction> {
     const hash = await this.connection.sendRawTransaction(Buffer.from(signed.raw, "base64"), { preflightCommitment: this.commitment, maxRetries: 3 });
     if (hash !== signed.hash) throw new Error("Broadcast signature differs from signed signature");
@@ -168,7 +214,9 @@ export class SolanaAdapter implements ChainAdapter {
     if (!transaction) return result;
     result.feeBaseUnits = BigInt(transaction.meta?.fee ?? 0);
     if (expected && transaction.meta && !failed) {
-      const keys = transaction.transaction.message.getAccountKeys().staticAccountKeys.map((key) => key.toBase58());
+      const loaded = transaction.meta.loadedAddresses;
+      const accountKeys = transaction.transaction.message.getAccountKeys(loaded ? { accountKeysFromLookups: loaded } : undefined);
+      const keys = accountKeys.keySegments().flat().map((key) => key.toBase58());
       if (expected.asset.kind === "native") {
         const index = keys.indexOf(expected.to);
         if (index >= 0) result.destinationDeltaBaseUnits = BigInt(transaction.meta.postBalances[index] ?? 0) - BigInt(transaction.meta.preBalances[index] ?? 0);

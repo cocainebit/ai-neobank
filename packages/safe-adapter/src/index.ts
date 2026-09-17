@@ -1,8 +1,12 @@
-import Safe from "@safe-global/protocol-kit";
-import { OperationType, type SafeTransaction } from "@safe-global/types-kit";
-import { createPublicClient, createWalletClient, defineChain, http, type Address, type Hex } from "viem";
+import Safe, { buildSignatureBytes, EthSafeSignature } from "@safe-global/protocol-kit";
+import { OperationType, type SafeTransaction, type SafeTransactionData } from "@safe-global/types-kit";
+import { createPublicClient, createWalletClient, defineChain, encodeFunctionData, erc20Abi, http, parseAbi, recoverAddress, type Address, type Hex } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { createRequire } from "node:module";
+import { randomBytes } from "node:crypto";
+
+/** Protocol Kit wants a numeric salt; a random 128-bit value keeps predicted addresses unique. */
+const randomSaltNonce = () => BigInt(`0x${randomBytes(16).toString("hex")}`).toString();
 
 interface Artifact { abi: readonly unknown[]; bytecode: Hex }
 const require = createRequire(import.meta.url);
@@ -29,11 +33,84 @@ export interface SafeAccountObservation {
 export interface SafeAdapterOptions {
   rpcUrl: string;
   chainId: number;
-  contracts: SafeContractAddresses;
+  /** Required for networks without canonical Safe deployments (local chains). */
+  contracts?: SafeContractAddresses;
 }
 
-function contractNetworks(chainId: number, contracts: SafeContractAddresses) {
-  return { [chainId.toString()]: contracts };
+/** The exact Safe transaction the owners sign; stored with the approval request. */
+export interface CompiledSafeTransaction {
+  to: string;
+  value: string;
+  data: string;
+  operation: number;
+  safeTxGas: string;
+  baseGas: string;
+  gasPrice: string;
+  gasToken: string;
+  refundReceiver: string;
+  nonce: number;
+  safeTxHash: string;
+}
+
+export interface OwnerSignature {
+  owner: string;
+  /** 65-byte hex signature over the Safe transaction hash. */
+  signature: string;
+}
+
+const execTransactionAbi = parseAbi([
+  "function execTransaction(address to, uint256 value, bytes data, uint8 operation, uint256 safeTxGas, uint256 baseGas, uint256 gasPrice, address gasToken, address refundReceiver, bytes signatures) payable returns (bool success)"
+]);
+
+export const safeTxTypes = {
+  SafeTx: [
+    { name: "to", type: "address" },
+    { name: "value", type: "uint256" },
+    { name: "data", type: "bytes" },
+    { name: "operation", type: "uint8" },
+    { name: "safeTxGas", type: "uint256" },
+    { name: "baseGas", type: "uint256" },
+    { name: "gasPrice", type: "uint256" },
+    { name: "gasToken", type: "address" },
+    { name: "refundReceiver", type: "address" },
+    { name: "nonce", type: "uint256" }
+  ]
+} as const;
+
+/** EIP-712 payload for a wallet's signTypedData; its digest is the Safe transaction hash. */
+export function safeTypedData(chainId: number, safeAddress: string, compiled: CompiledSafeTransaction) {
+  return {
+    domain: { chainId, verifyingContract: safeAddress as Address },
+    types: safeTxTypes,
+    primaryType: "SafeTx" as const,
+    message: {
+      to: compiled.to as Address,
+      value: BigInt(compiled.value),
+      data: compiled.data as Hex,
+      operation: compiled.operation,
+      safeTxGas: BigInt(compiled.safeTxGas),
+      baseGas: BigInt(compiled.baseGas),
+      gasPrice: BigInt(compiled.gasPrice),
+      gasToken: compiled.gasToken as Address,
+      refundReceiver: compiled.refundReceiver as Address,
+      nonce: BigInt(compiled.nonce)
+    }
+  };
+}
+
+/** The same payload with decimal strings instead of BigInts, safe for JSON and accepted by eth_signTypedData_v4. */
+export function safeTypedDataJson(chainId: number, safeAddress: string, compiled: CompiledSafeTransaction) {
+  const typed = safeTypedData(chainId, safeAddress, compiled);
+  return {
+    ...typed,
+    types: { EIP712Domain: [{ name: "chainId", type: "uint256" }, { name: "verifyingContract", type: "address" }], ...typed.types },
+    message: { ...typed.message, value: typed.message.value.toString(), safeTxGas: typed.message.safeTxGas.toString(), baseGas: typed.message.baseGas.toString(), gasPrice: typed.message.gasPrice.toString(), nonce: typed.message.nonce.toString() }
+  };
+}
+
+/** Recovers the owner that signed the Safe transaction hash with signTypedData. */
+export async function recoverSafeSigner(safeTxHash: string, signature: string): Promise<string> {
+  return recoverAddress({ hash: safeTxHash as Hex, signature: signature as Hex });
 }
 
 export async function deploySafeProtocolFixture(rpcUrl: string, chainId: number, deployerKey: Hex): Promise<SafeContractAddresses> {
@@ -58,37 +135,39 @@ export async function deploySafeProtocolFixture(rpcUrl: string, chainId: number,
 }
 
 export class SafeGovernanceAdapter {
-  private readonly networkConfig;
+  private readonly networkConfig: Record<string, SafeContractAddresses> | undefined;
   constructor(private readonly options: SafeAdapterOptions) {
-    this.networkConfig = contractNetworks(options.chainId, options.contracts);
+    this.networkConfig = options.contracts ? { [options.chainId.toString()]: options.contracts } : undefined;
   }
 
-  async deploy(ownerPrivateKey: Hex, owners: string[], threshold: number, saltNonce: string = crypto.randomUUID()): Promise<{ address: string; transactionHash: string }> {
+  private kitConfig(extra: Record<string, unknown>) {
+    return { provider: this.options.rpcUrl, ...extra, ...(this.networkConfig ? { contractNetworks: this.networkConfig } : {}) };
+  }
+
+  /** Predicts the Safe address and returns the deployment transaction for any funded wallet to send. */
+  async prepareDeployment(owners: string[], threshold: number, saltNonce: string = randomSaltNonce()): Promise<{ address: string; to: string; data: string; value: string; saltNonce: string }> {
     if (threshold < 1 || threshold > owners.length) throw new Error("Invalid Safe threshold");
     if (new Set(owners.map((owner) => owner.toLowerCase())).size !== owners.length) throw new Error("Safe owners must be unique");
-    const kit = await Safe.init({
-      provider: this.options.rpcUrl,
-      signer: ownerPrivateKey,
-      predictedSafe: { safeAccountConfig: { owners, threshold }, safeDeploymentConfig: { saltNonce, safeVersion: "1.4.1" } },
-      contractNetworks: this.networkConfig
-    });
-    const address = await kit.getAddress();
+    const kit = await Safe.init(this.kitConfig({ predictedSafe: { safeAccountConfig: { owners, threshold }, safeDeploymentConfig: { saltNonce, safeVersion: "1.4.1" } } }) as never);
     const deployment = await kit.createSafeDeploymentTransaction();
-    const chain = defineChain({ id: this.options.chainId, name: `safe-${this.options.chainId}`, nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 }, rpcUrls: { default: { http: [this.options.rpcUrl] } } });
-    const account = privateKeyToAccount(ownerPrivateKey);
-    const wallet = createWalletClient({ account, chain, transport: http(this.options.rpcUrl) });
-    const publicClient = createPublicClient({ chain, transport: http(this.options.rpcUrl) });
-    const transactionHash = await wallet.sendTransaction({ account, to: deployment.to as Address, data: deployment.data as Hex, value: BigInt(deployment.value) });
-    const receipt = await publicClient.waitForTransactionReceipt({ hash: transactionHash });
-    if (receipt.status !== "success") throw new Error("Safe deployment transaction reverted");
-    return { address, transactionHash };
+    return { address: await kit.getAddress(), to: deployment.to, data: deployment.data, value: deployment.value, saltNonce };
   }
 
-  private connect(safeAddress: string, signer?: Hex) {
-    const config = signer
-      ? { provider: this.options.rpcUrl, signer, safeAddress, contractNetworks: this.networkConfig }
-      : { provider: this.options.rpcUrl, safeAddress, contractNetworks: this.networkConfig };
-    return Safe.init(config);
+  /** Deploys with a locally held key; for tests and tooling only. */
+  async deploy(deployerPrivateKey: Hex, owners: string[], threshold: number, saltNonce: string = randomSaltNonce()): Promise<{ address: string; transactionHash: string }> {
+    const prepared = await this.prepareDeployment(owners, threshold, saltNonce);
+    const chain = defineChain({ id: this.options.chainId, name: `safe-${this.options.chainId}`, nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 }, rpcUrls: { default: { http: [this.options.rpcUrl] } } });
+    const account = privateKeyToAccount(deployerPrivateKey);
+    const wallet = createWalletClient({ account, chain, transport: http(this.options.rpcUrl) });
+    const publicClient = createPublicClient({ chain, transport: http(this.options.rpcUrl) });
+    const transactionHash = await wallet.sendTransaction({ account, to: prepared.to as Address, data: prepared.data as Hex, value: BigInt(prepared.value) });
+    const receipt = await publicClient.waitForTransactionReceipt({ hash: transactionHash });
+    if (receipt.status !== "success") throw new Error("Safe deployment transaction reverted");
+    return { address: prepared.address, transactionHash };
+  }
+
+  private connect(safeAddress: string) {
+    return Safe.init(this.kitConfig({ safeAddress }) as never);
   }
 
   async observe(safeAddress: string): Promise<SafeAccountObservation> {
@@ -99,23 +178,57 @@ export class SafeGovernanceAdapter {
     return { address: safeAddress, owners, threshold, nonce, balance, modules, guard };
   }
 
-  async buildNativeTransfer(safeAddress: string, signer: Hex, to: string, amountBaseUnits: bigint): Promise<{ transaction: SafeTransaction; safeTransactionHash: string }> {
+  /** Builds the Safe transaction for a native or ERC-20 transfer at the Safe's current nonce and computes its hash. */
+  async compileTransfer(safeAddress: string, asset: { kind: "native" } | { kind: "erc20"; address: string }, to: string, amountBaseUnits: bigint): Promise<CompiledSafeTransaction> {
     if (amountBaseUnits <= 0n) throw new Error("Transfer amount must be positive");
-    const kit = await this.connect(safeAddress, signer);
+    const kit = await this.connect(safeAddress);
+    const call = asset.kind === "native"
+      ? { to, value: amountBaseUnits.toString(), data: "0x", operation: OperationType.Call }
+      : { to: asset.address, value: "0", data: encodeFunctionData({ abi: erc20Abi, functionName: "transfer", args: [to as Address, amountBaseUnits] }), operation: OperationType.Call };
+    const transaction = await kit.createTransaction({ transactions: [call] });
+    const data = transaction.data;
+    return { ...this.plain(data), safeTxHash: await kit.getTransactionHash(transaction) };
+  }
+
+  private plain(data: SafeTransactionData): Omit<CompiledSafeTransaction, "safeTxHash"> {
+    return { to: data.to, value: data.value, data: data.data, operation: data.operation, safeTxGas: data.safeTxGas, baseGas: data.baseGas, gasPrice: data.gasPrice, gasToken: data.gasToken, refundReceiver: data.refundReceiver, nonce: data.nonce };
+  }
+
+  /** Calldata for execTransaction with owner signatures ordered as the Safe requires. Any funded account may send it. */
+  encodeExecution(compiled: CompiledSafeTransaction, signatures: OwnerSignature[]): Hex {
+    const ordered = [...signatures].sort((a, b) => a.owner.toLowerCase().localeCompare(b.owner.toLowerCase()));
+    const bytes = buildSignatureBytes(ordered.map((entry) => new EthSafeSignature(entry.owner, entry.signature)));
+    return encodeFunctionData({
+      abi: execTransactionAbi,
+      functionName: "execTransaction",
+      args: [compiled.to as Address, BigInt(compiled.value), compiled.data as Hex, compiled.operation, BigInt(compiled.safeTxGas), BigInt(compiled.baseGas), BigInt(compiled.gasPrice), compiled.gasToken as Address, compiled.refundReceiver as Address, bytes as Hex]
+    });
+  }
+
+  /** Test and tooling helper: signs the way a wallet's signTypedData would, with a locally held owner key. */
+  async signTypedDataFor(safeAddress: string, compiled: CompiledSafeTransaction, ownerPrivateKey: Hex): Promise<OwnerSignature> {
+    const account = privateKeyToAccount(ownerPrivateKey);
+    const signature = await account.signTypedData(safeTypedData(this.options.chainId, safeAddress, compiled));
+    return { owner: account.address, signature };
+  }
+
+  /** Kept for the standalone lifecycle test: Protocol Kit's own signature and execution path. */
+  async buildNativeTransfer(safeAddress: string, signer: Hex, to: string, amountBaseUnits: bigint): Promise<{ transaction: SafeTransaction; safeTransactionHash: string }> {
+    const kit = await Safe.init(this.kitConfig({ signer, safeAddress }) as never);
     const transaction = await kit.createTransaction({ transactions: [{ to, value: amountBaseUnits.toString(), data: "0x", operation: OperationType.Call }] });
     return { transaction, safeTransactionHash: await kit.getTransactionHash(transaction) };
   }
 
   async collectSignatures(safeAddress: string, transaction: SafeTransaction, safeTransactionHash: string, ownerPrivateKeys: Hex[]): Promise<SafeTransaction> {
     for (const ownerPrivateKey of ownerPrivateKeys) {
-      const kit = await this.connect(safeAddress, ownerPrivateKey);
+      const kit = await Safe.init(this.kitConfig({ signer: ownerPrivateKey, safeAddress }) as never);
       transaction.addSignature(await kit.signHash(safeTransactionHash));
     }
     return transaction;
   }
 
   async execute(safeAddress: string, executorPrivateKey: Hex, transaction: SafeTransaction): Promise<{ transactionHash: string }> {
-    const kit = await this.connect(safeAddress, executorPrivateKey);
+    const kit = await Safe.init(this.kitConfig({ signer: executorPrivateKey, safeAddress }) as never);
     const result = await kit.executeTransaction(transaction);
     return { transactionHash: result.hash };
   }

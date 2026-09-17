@@ -3,7 +3,7 @@ import postgres, { type Sql, type TransactionSql } from "postgres";
 type Db = Sql | TransactionSql;
 import type { PaymentIntent, PolicyDefinition, PrincipalRole } from "@ai-neobank/domain";
 import { nativeAssetIds } from "@ai-neobank/domain";
-export { createPostgresJobQueue, PostgresJobQueue, ExecutionRejected, Deferred, type JobRecord, type ExecutionContext, type ConfirmationContext, type SimulationEvidence, type Simulator, type AssetShape } from "./jobs.js";
+export { createPostgresJobQueue, PostgresJobQueue, ExecutionRejected, Deferred, type JobRecord, type ExecutionContext, type ConfirmationContext, type SimulationEvidence, type Simulator, type AssetShape, type PublishContext, type Publisher, type ProposalObservation, type Observer } from "./jobs.js";
 
 export interface OrganizationRecord {
   id: string;
@@ -107,6 +107,8 @@ export interface TreasuryRecord {
   address: string;
   governance: "safe" | "squads" | "direct";
   status: "pending_verification" | "active" | "degraded" | "frozen";
+  executorSignerId: string | null;
+  observedConfiguration: Record<string, unknown>;
   createdAt: string;
 }
 
@@ -204,7 +206,8 @@ export interface ApprovalRequestRecord {
   simulationHash: string | null;
   status: string;
   expiresAt: string;
-  decisions: { principalId: string; decision: string; createdAt: string }[];
+  externalRef: Record<string, unknown> | null;
+  decisions: { principalId: string | null; signerAddress: string | null; decision: string; createdAt: string }[];
 }
 
 export interface LedgerEntryRecord {
@@ -245,7 +248,7 @@ export interface CreateAgentInput {
 const organizationColumns = `id::text, name, slug, environment, frozen, autonomous_execution as "autonomousExecution", created_at::text as "createdAt"`;
 const principalColumns = `id::text, organization_id::text as "organizationId", type, display_name as "displayName", role, status`;
 const walletColumns = `id::text, organization_id::text as "organizationId", principal_id::text as "principalId", chain_family as "chainFamily", address, verified_at::text as "verifiedAt"`;
-const treasuryColumns = `id::text, organization_id::text as "organizationId", name, chain_family as "chainFamily", network, address, governance, status, created_at::text as "createdAt"`;
+const treasuryColumns = `id::text, organization_id::text as "organizationId", name, chain_family as "chainFamily", network, address, governance, status, executor_signer_id::text as "executorSignerId", observed_configuration as "observedConfiguration", created_at::text as "createdAt"`;
 const signerColumns = `id::text, organization_id::text as "organizationId", agent_id::text as "agentId", chain_family as "chainFamily", address, custody, status, created_at::text as "createdAt"`;
 const agentColumns = `a.id::text, a.organization_id::text as "organizationId", a.principal_id::text as "principalId", p.display_name as "displayName", a.purpose, a.status, a.capability_version as "capabilityVersion", a.owner_principal_id::text as "ownerPrincipalId"`;
 const credentialColumns = `id::text, organization_id::text as "organizationId", agent_id::text as "agentId", key_id as "keyId", label, status, created_at::text as "createdAt", last_used_at::text as "lastUsedAt"`;
@@ -514,16 +517,21 @@ export class PostgresControlPlaneStore {
 
   // Treasuries
 
-  async createTreasury(organizationId: string, input: { name: string; chainFamily: "evm" | "svm"; network: string; address: string; governance: TreasuryRecord["governance"] }, actorPrincipalId?: string): Promise<TreasuryRecord> {
+  async createTreasury(organizationId: string, input: { name: string; chainFamily: "evm" | "svm"; network: string; address: string; governance: TreasuryRecord["governance"]; executorSignerId?: string; observedConfiguration?: Record<string, unknown> }, actorPrincipalId?: string): Promise<TreasuryRecord> {
     return this.sql.begin(async (tx) => {
-      const rows = await tx.unsafe<TreasuryRecord[]>(
-        `insert into treasury_accounts (organization_id, name, chain_family, network, address, governance, status) values ($1, $2, $3, $4, $5, $6, 'active') returning ${treasuryColumns}`,
-        [organizationId, input.name, input.chainFamily, input.network, input.address, input.governance]
-      );
+      const rows = await tx<TreasuryRecord[]>`
+        insert into treasury_accounts (organization_id, name, chain_family, network, address, governance, status, executor_signer_id, observed_configuration)
+        values (${organizationId}, ${input.name}, ${input.chainFamily}, ${input.network}, ${input.address}, ${input.governance}, 'active', ${input.executorSignerId ?? null}, ${tx.json((input.observedConfiguration ?? {}) as never)})
+        returning id::text, organization_id::text as "organizationId", name, chain_family as "chainFamily", network, address, governance, status, executor_signer_id::text as "executorSignerId", observed_configuration as "observedConfiguration", created_at::text as "createdAt"
+      `;
       if (!rows[0]) throw new Error("Treasury insert returned no row");
-      await this.audit(tx, organizationId, actorPrincipalId ?? null, "treasury.created", "treasury", rows[0].id, { network: input.network, address: input.address, governance: input.governance });
+      await this.audit(tx, organizationId, actorPrincipalId ?? null, "treasury.created", "treasury", rows[0].id, { network: input.network, address: input.address, governance: input.governance, executorSignerId: input.executorSignerId ?? null, observedConfiguration: input.observedConfiguration ?? {} });
       return rows[0];
     });
+  }
+
+  async updateTreasuryObservation(organizationId: string, treasuryId: string, observedConfiguration: Record<string, unknown>): Promise<void> {
+    await this.sql`update treasury_accounts set observed_configuration = ${this.sql.json(observedConfiguration as never)}, updated_at = now() where organization_id = ${organizationId} and id = ${treasuryId}`;
   }
 
   listTreasuries(organizationId: string): Promise<TreasuryRecord[]> {
@@ -533,6 +541,14 @@ export class PostgresControlPlaneStore {
   async getTreasury(organizationId: string, treasuryId: string): Promise<TreasuryRecord | null> {
     const rows = await this.sql.unsafe<TreasuryRecord[]>(`select ${treasuryColumns} from treasury_accounts where organization_id = $1 and id = $2`, [organizationId, treasuryId]);
     return rows[0] ?? null;
+  }
+
+  /** Wallet addresses of the organisation's human principals, for mapping on-chain votes to people. */
+  async walletsByAddress(organizationId: string, chainFamily: "evm" | "svm"): Promise<Map<string, { principalId: string; walletId: string }>> {
+    const rows = await this.sql<{ address: string; principalId: string; walletId: string }[]>`
+      select address, principal_id::text as "principalId", id::text as "walletId" from human_wallets where organization_id = ${organizationId} and chain_family = ${chainFamily}
+    `;
+    return new Map(rows.map((row) => [chainFamily === "evm" ? row.address.toLowerCase() : row.address, { principalId: row.principalId, walletId: row.walletId }]));
   }
 
   async setTreasuryStatus(organizationId: string, treasuryId: string, status: TreasuryRecord["status"], actorPrincipalId: string): Promise<TreasuryRecord | null> {
@@ -744,20 +760,20 @@ export class PostgresControlPlaneStore {
       select ar.intent_id::text as "intentId", ar.required_approvals as "requiredApprovals",
         count(a.id) filter (where a.decision = 'approved')::int as approvals,
         ar.compiled_hash as "compiledHash", ar.simulation_hash as "simulationHash",
-        ar.status, ar.expires_at::text as "expiresAt"
+        ar.status, ar.expires_at::text as "expiresAt", ar.external_ref as "externalRef"
       from approval_requests ar left join approvals a on a.intent_id = ar.intent_id
       where ar.organization_id = ${organizationId} and ar.intent_id = ${intentId}
       group by ar.id
     `;
     const request = rows[0];
     if (!request) return null;
-    const decisions = await this.sql<{ principalId: string; decision: string; createdAt: string }[]>`
-      select approver_principal_id::text as "principalId", decision, created_at::text as "createdAt" from approvals where intent_id = ${intentId} order by created_at
+    const decisions = await this.sql<{ principalId: string | null; signerAddress: string | null; decision: string; createdAt: string }[]>`
+      select approver_principal_id::text as "principalId", signer_address as "signerAddress", decision, created_at::text as "createdAt" from approvals where intent_id = ${intentId} order by created_at
     `;
     return { ...request, decisions };
   }
 
-  async decideIntent(organizationId: string, intentId: string, input: { principalId: string; decision: "approved" | "rejected"; expectedIntentVersion: number; compiledHash: string; simulationHash: string; signedPayload?: string }): Promise<ApprovalResult> {
+  async decideIntent(organizationId: string, intentId: string, input: { principalId: string; decision: "approved" | "rejected"; expectedIntentVersion: number; compiledHash: string; simulationHash: string; signedPayload?: string; signerAddress?: string }): Promise<ApprovalResult> {
     return this.sql.begin(async (tx): Promise<ApprovalResult> => {
       const principals = await tx<PrincipalRecord[]>`
         select id::text, organization_id::text as "organizationId", type, display_name as "displayName", role, status
@@ -796,8 +812,8 @@ export class PostgresControlPlaneStore {
       if (input.decision === "approved" && (state.organizationFrozen || state.treasuryStatus === "frozen" || state.requesterStatus !== "active")) throw new ApprovalError("frozen");
       if (!state.compiledHash || !state.simulationHash || state.compiledHash !== input.compiledHash || state.simulationHash !== input.simulationHash) throw new ApprovalError("evidence_mismatch");
       await tx`
-        insert into approvals (organization_id, intent_id, approver_principal_id, decision, signed_payload)
-        values (${organizationId}, ${intentId}, ${input.principalId}, ${input.decision}, ${input.signedPayload ?? null})
+        insert into approvals (organization_id, intent_id, approver_principal_id, decision, signed_payload, signer_address)
+        values (${organizationId}, ${intentId}, ${input.principalId}, ${input.decision}, ${input.signedPayload ?? null}, ${input.signerAddress ?? null})
       `;
       const counts = await tx<{ count: number }[]>`select count(*)::int as count from approvals where intent_id = ${intentId} and decision = 'approved'`;
       const approvals = counts[0]?.count ?? 0;

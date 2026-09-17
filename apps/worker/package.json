@@ -8,7 +8,7 @@
     "dev": "tsx watch src/main.ts",
     "start": "node dist/main.js",
     "test": "vitest run --passWithNoTests",
-    "test:integration": "RUN_WORKER_INTEGRATION=1 vitest run src/integration.test.ts",
+    "test:integration": "RUN_WORKER_INTEGRATION=1 vitest run src/integration.test.ts src/governance.test.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
@@ -18,7 +18,9 @@
     "@ai-neobank/solana-adapter": "workspace:*",
     "@solana/web3.js": "^1.98.4",
     "@ai-neobank/chain-core": "workspace:*",
-    "@ai-neobank/domain": "workspace:*"
+    "@ai-neobank/domain": "workspace:*",
+    "@ai-neobank/safe-adapter": "workspace:*",
+    "@ai-neobank/squads-adapter": "workspace:*"
   },
   "devDependencies": {
     "@types/node": "^22.18.1",

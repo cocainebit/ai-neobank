@@ -120,14 +120,36 @@ export class EvmAdapter implements ChainAdapter {
   /** Signs without sending. The returned hash is the keccak of the signed bytes, so it is known before broadcast. */
   async signTransfer(request: TransferRequest, privateKey: Hex): Promise<SignedTransaction> {
     assertPositiveTransfer(request);
+    return this.signCall({ from: request.from, ...this.call(request) }, privateKey);
+  }
+
+  /** Signs an arbitrary call from the key's account, for example a Safe execTransaction. */
+  async signCall(call: { from: string; to: string; value?: bigint; data?: Hex }, privateKey: Hex): Promise<SignedTransaction> {
     const account = privateKeyToAccount(privateKey);
-    if (account.address.toLowerCase() !== request.from.toLowerCase()) {
-      throw new Error("Signer does not match transfer source");
+    if (account.address.toLowerCase() !== call.from.toLowerCase()) {
+      throw new Error("Signer does not match call sender");
     }
-    const call = this.call(request);
-    const prepared = await this.publicClient.prepareTransactionRequest({ account, chain: this.chain, ...call });
+    const prepared = await this.publicClient.prepareTransactionRequest({ account, chain: this.chain, to: call.to as Address, value: call.value ?? 0n, ...(call.data ? { data: call.data } : {}) });
     const raw = await account.signTransaction(prepared as Parameters<typeof account.signTransaction>[0]);
     return { hash: keccak256(raw), raw, nonce: String(prepared.nonce), validUntil: "" };
+  }
+
+  /** Simulates an arbitrary call and returns the fee estimate in wei. */
+  async simulateCall(call: { from: string; to: string; value?: bigint; data?: Hex }): Promise<TransferSimulation> {
+    try {
+      const [gas, fees] = await Promise.all([
+        this.publicClient.estimateGas({ account: call.from as Address, to: call.to as Address, value: call.value ?? 0n, ...(call.data ? { data: call.data } : {}) }),
+        this.publicClient.estimateFeesPerGas()
+      ]);
+      return { ok: true, feeBaseUnits: gas * fees.maxFeePerGas };
+    } catch (error) {
+      return { ok: false, feeBaseUnits: 0n, error: error instanceof Error ? error.message : "Unknown simulation error" };
+    }
+  }
+
+  /** Native balance at a specific block; used to prove internal transfers made by a contract such as a Safe. */
+  balanceAt(address: string, blockNumber: bigint): Promise<bigint> {
+    return this.publicClient.getBalance({ address: address as Address, blockNumber });
   }
 
   async broadcast(signed: SignedTransaction): Promise<SubmittedTransaction> {
@@ -168,7 +190,16 @@ export class EvmAdapter implements ChainAdapter {
     if (expected && !failed) {
       if (expected.asset.kind === "native") {
         const transaction = await this.publicClient.getTransaction({ hash: hash as Hex });
-        if (transaction.to?.toLowerCase() === expected.to.toLowerCase()) result.destinationDeltaBaseUnits = transaction.value;
+        if (transaction.to?.toLowerCase() === expected.to.toLowerCase()) {
+          result.destinationDeltaBaseUnits = transaction.value;
+        } else {
+          // Value moved inside a contract call (Safe execTransaction): prove it from the balance change across the block.
+          const [before, after] = await Promise.all([
+            this.balanceAt(expected.to, receipt.blockNumber - 1n),
+            this.balanceAt(expected.to, receipt.blockNumber)
+          ]);
+          result.destinationDeltaBaseUnits = after - before;
+        }
       } else if (expected.asset.kind === "erc20") {
         const token = expected.asset.address.toLowerCase();
         let delta = 0n;

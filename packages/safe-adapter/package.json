@@ -23,6 +23,7 @@
   "devDependencies": {
     "@types/node": "^22.18.1",
     "@safe-global/safe-contracts": "1.4.1",
-    "vitest": "^3.2.4"
+    "vitest": "^3.2.4",
+    "@ai-neobank/evm-adapter": "workspace:*"
   }
 }

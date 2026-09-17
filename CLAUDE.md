@@ -11,7 +11,7 @@ Codex 2026-09-16/17, taken over by Claude 2026-09-17. Status report with evidenc
 
 | instance | writes | mid-way through |
 |---|---|---|
-| achi-b6 (Claude, takeover) | everything under this repo | **done:** wallet auth, agent keys, policy/freeze/quorum on the durable path, sign-before-broadcast recovery, real finality, fee ledger, ERC-20/SPL. **next:** Safe + Squads on the intent path, x402, frontend on the real API |
+| achi-b6 (Claude, takeover) | everything under this repo | **done:** wallet auth, agent keys, policy/freeze/quorum on the durable path, sign-before-broadcast recovery, real finality, fee ledger, ERC-20/SPL. Safe + Squads on the intent path (executor never votes). **next:** x402, frontend on the real API, invoicing |
 
 ## Ports (this repo's block is 8720-8729)
 
@@ -25,5 +25,7 @@ Never run integration tests against 8545/8899: those belong to other repos.
 
 - The Codex dev signer `0x9ECc...279d` and its master key are in a Codex log in
   plaintext. Treat as compromised; never fund it off a local chain.
+- Integration suites share one Postgres job queue. Run them one at a time: a
+  worker configured for one chain will claim and poison another suite's jobs.
 - The Codex thread goal is still active and auto-continues on resume (usage reset
   2026-09-22). Do not resume it without giving it the current state first.

@@ -44,14 +44,54 @@ export interface ExecutionContext {
   amountBaseUnits: string;
   intentStatus: string;
   intentVersion: number;
+  /** The key that signs: the treasury itself (direct) or the organisation's executor (Safe, Squads). */
   signerId: string;
+  signerAddress: string;
   encryptedSecret: string;
   encryptionNonce: string;
   authTag: string;
   keyVersion: number;
   approvalCompiledHash: string;
+  externalRef: Record<string, unknown> | null;
+  treasuryConfiguration: Record<string, unknown>;
+  /** Off-chain owner signatures collected for a Safe transaction. */
+  ownerSignatures: { signerAddress: string; signedPayload: string }[];
   execution: { id: string; status: string; transactionHash: string | null; signedPayload: string | null; nonce: string | null; validUntil: string | null } | null;
 }
+
+export interface PublishContext {
+  intentId: string;
+  organizationId: string;
+  treasuryId: string;
+  network: string;
+  chainFamily: "evm" | "svm";
+  governance: "safe" | "squads";
+  from: string;
+  to: string;
+  asset: AssetShape;
+  amountBaseUnits: string;
+  expiresAt: string;
+  minApprovals: number;
+  treasuryConfiguration: Record<string, unknown>;
+  executorSignerId: string;
+  executorAddress: string;
+  encryptedSecret: string;
+  encryptionNonce: string;
+  authTag: string;
+  keyVersion: number;
+  /** What a previous, possibly crashed, attempt recorded before broadcasting. */
+  publication: Record<string, unknown> | null;
+}
+
+export type Publisher = (context: PublishContext) => Promise<{ compiledHash: string; requiredApprovals: number; externalRef: Record<string, unknown> }>;
+
+export interface ProposalObservation {
+  status: "draft" | "active" | "rejected" | "approved" | "executing" | "executed" | "cancelled";
+  approved: string[];
+  rejected: string[];
+}
+
+export type Observer = (input: { organizationId: string; chainFamily: "evm" | "svm"; network: string; externalRef: Record<string, unknown>; treasuryConfiguration: Record<string, unknown> }) => Promise<ProposalObservation | null>;
 
 export interface ConfirmationContext {
   intentId: string;
@@ -74,7 +114,7 @@ export interface SimulationEvidence {
   error?: string;
 }
 
-export type Simulator = (input: { chainFamily: "evm" | "svm"; network: string; from: string; to: string; asset: AssetShape; amountBaseUnits: string; intentId: string }) => Promise<SimulationEvidence>;
+export type Simulator = (input: { chainFamily: "evm" | "svm"; network: string; governance: "safe" | "squads" | "direct"; treasuryConfiguration: Record<string, unknown>; from: string; to: string; asset: AssetShape; amountBaseUnits: string; intentId: string }) => Promise<SimulationEvidence>;
 
 interface IntentRow {
   intentId: string;
@@ -90,6 +130,10 @@ interface IntentRow {
   treasuryNetwork: string;
   chainFamily: "evm" | "svm";
   governance: "safe" | "squads" | "direct";
+  executorSignerId: string | null;
+  observedConfiguration: Record<string, unknown>;
+  publication: Record<string, unknown> | null;
+  policyDecision: Record<string, unknown> | null;
   from: string;
   idempotencyKey: string;
   kind: "transfer" | "x402";
@@ -113,6 +157,7 @@ const intentJoin = `
     i.requester_principal_id::text as "requesterId", rp.type as "requesterType", rp.status as "requesterStatus", ag.status as "agentStatus",
     o.frozen as "organizationFrozen", o.autonomous_execution as "autonomousExecution",
     t.status as "treasuryStatus", t.network as "treasuryNetwork", t.chain_family as "chainFamily", t.governance, t.address as "from",
+    t.executor_signer_id::text as "executorSignerId", t.observed_configuration as "observedConfiguration", i.publication, i.policy_decision as "policyDecision",
     i.idempotency_key as "idempotencyKey", i.kind, i.network, i.asset_id as "assetId",
     a.kind as "assetKind", a.address as "assetAddress", a.decimals as "assetDecimals", a.network as "assetNetwork",
     i.amount_base_units::text as "amountBaseUnits", i.destination, i.purpose, i.status, i.version, i.expires_at::text as "expiresAt",
@@ -289,13 +334,29 @@ export class PostgresJobQueue {
     }
     let evidence: SimulationEvidence = { ok: true, feeBaseUnits: "0", sourceBalanceBaseUnits: "unknown" };
     if (simulate) {
-      evidence = await simulate({ chainFamily: row.chainFamily, network: row.network, from: row.from, to: row.destination, asset, amountBaseUnits: row.amountBaseUnits, intentId });
+      evidence = await simulate({ chainFamily: row.chainFamily, network: row.network, governance: row.governance, treasuryConfiguration: row.observedConfiguration ?? {}, from: row.from, to: row.destination, asset, amountBaseUnits: row.amountBaseUnits, intentId });
       if (!evidence.ok) {
         await this.reject(intentId, row, { outcome: "rejected", reasons: [`Simulation failed: ${evidence.error ?? "unknown"}`] }, policyResult?.versionId ?? null);
         return;
       }
     }
     const requiredApprovals = policyResult?.policy.minApprovals ?? 1;
+    if (row.governance !== "direct") {
+      // Governed treasuries: owners decide on chain or with owner signatures, so the
+      // proposal is published first and the approval request follows from it.
+      await this.sql.begin(async (tx) => {
+        const locked = await tx<{ status: string }[]>`select status from intents where id = ${intentId} for update`;
+        if (locked[0]?.status !== "received") return;
+        const simulationHash = await this.hash(tx, ["simulation-v1", intentId, row.network, row.amountBaseUnits, row.destination, evidence.feeBaseUnits, evidence.sourceBalanceBaseUnits]);
+        await tx`update intents set policy_version_id = ${policyResult?.versionId ?? null}, policy_decision = ${tx.json({ outcome: "approval_required", reasons: [...decision.reasons, `${row.governance} treasury: owners approve on chain`], spentTodayBaseUnits: spent, simulation: evidence, simulationHash, minApprovals: requiredApprovals } as never)} where id = ${intentId}`;
+        await this.transition(tx, intentId, row.organizationId, row.version, "received", "policy_evaluated", "intent.policy_evaluated", { governance: row.governance, requiredApprovals });
+        await tx`
+          insert into outbox_events (organization_id, topic, aggregate_type, aggregate_id, payload)
+          values (${row.organizationId}, 'proposal.publish', 'intent', ${intentId}, ${tx.json({ intentId })})
+        `;
+      });
+      return;
+    }
     const autonomous = decision.outcome === "auto_authorized" && row.autonomousExecution;
     const reasons = decision.outcome === "auto_authorized" && !row.autonomousExecution
       ? [...decision.reasons, "Autonomous execution is disabled for this organization"]
@@ -345,6 +406,119 @@ export class PostgresJobQueue {
     return rows[0]!.hash;
   }
 
+  /** Everything the worker needs to publish a governed intent's proposal. */
+  async getPublishContext(intentId: string): Promise<PublishContext> {
+    const rows = await this.sql.unsafe<(IntentRow & { signerAddress: string | null; encryptedSecret: string | null; encryptionNonce: string | null; authTag: string | null; keyVersion: number | null; signerStatus: string | null })[]>(`
+      select base.*, s.address as "signerAddress", s.encrypted_secret as "encryptedSecret", s.encryption_nonce as "encryptionNonce", s.auth_tag as "authTag", s.key_version as "keyVersion", s.status as "signerStatus"
+      from (${intentJoin} where i.id = $1) base
+      left join signers s on s.id = base."executorSignerId"::uuid and s.organization_id = base."organizationId"::uuid
+    `, [intentId]);
+    const row = rows[0];
+    if (!row) throw new Error("Intent not found");
+    if (row.status !== "policy_evaluated") throw new Error(`Intent is ${row.status}, not policy_evaluated`);
+    if (row.governance === "direct") throw new ExecutionRejected("Direct treasuries do not publish proposals");
+    const gate = this.gate(row);
+    if (gate) throw new ExecutionRejected(gate);
+    if (!row.executorSignerId || !row.signerAddress || !row.encryptedSecret || !row.encryptionNonce || !row.authTag || row.keyVersion === null) throw new ExecutionRejected("Treasury has no executor signer");
+    if (row.signerStatus !== "active") throw new ExecutionRejected(`Executor signer is ${row.signerStatus}`);
+    if (new Date(row.expiresAt) <= new Date()) throw new ExecutionRejected("Intent expired before publication");
+    const minApprovals = Number((row.policyDecision as { minApprovals?: number } | null)?.minApprovals ?? 1);
+    return {
+      intentId, organizationId: row.organizationId, treasuryId: row.treasuryId, network: row.network, chainFamily: row.chainFamily, governance: row.governance,
+      from: row.from, to: row.destination, asset: { id: row.assetId, kind: row.assetKind!, address: row.assetAddress, decimals: row.assetDecimals! }, amountBaseUnits: row.amountBaseUnits,
+      expiresAt: row.expiresAt, minApprovals, treasuryConfiguration: row.observedConfiguration ?? {},
+      executorSignerId: row.executorSignerId, executorAddress: row.signerAddress, encryptedSecret: row.encryptedSecret, encryptionNonce: row.encryptionNonce, authTag: row.authTag, keyVersion: row.keyVersion,
+      publication: row.publication
+    };
+  }
+
+  /** Persists what the publisher is about to broadcast so a retry can recognise its own work. */
+  async recordPublication(intentId: string, publication: Record<string, unknown>): Promise<void> {
+    await this.sql`update intents set publication = ${this.sql.json(publication as never)}, updated_at = now() where id = ${intentId}`;
+  }
+
+  /** Publication done: the approval request now points at the Safe hash or the Squads proposal. */
+  async completePublication(intentId: string, result: { compiledHash: string; requiredApprovals: number; externalRef: Record<string, unknown> }): Promise<void> {
+    await this.sql.begin(async (tx) => {
+      const rows = await tx<{ organizationId: string; status: string; version: number; expiresAt: string; governance: string; simulationHash: string | null }[]>`
+        select i.organization_id::text as "organizationId", i.status, i.version, i.expires_at::text as "expiresAt", t.governance, i.policy_decision->>'simulationHash' as "simulationHash"
+        from intents i join treasury_accounts t on t.id = i.treasury_account_id where i.id = ${intentId} for update of i
+      `;
+      const row = rows[0];
+      if (!row) throw new Error("Intent not found");
+      if (row.status !== "policy_evaluated") return;
+      await this.transition(tx, intentId, row.organizationId, row.version, "policy_evaluated", "approval_required", "intent.approval_required", { requiredApprovals: result.requiredApprovals, externalRef: result.externalRef });
+      await tx`
+        insert into approval_requests (organization_id, intent_id, required_approvals, compiled_hash, simulation_hash, external_ref, expires_at)
+        values (${row.organizationId}, ${intentId}, ${result.requiredApprovals}, ${result.compiledHash}, ${row.simulationHash ?? ""}, ${tx.json(result.externalRef as never)}, ${row.expiresAt})
+        on conflict (intent_id) do update set required_approvals = excluded.required_approvals, compiled_hash = excluded.compiled_hash, external_ref = excluded.external_ref
+      `;
+      await tx`
+        insert into outbox_events (organization_id, topic, aggregate_type, aggregate_id, payload, available_at)
+        values (${row.organizationId}, 'approval.expire', 'intent', ${intentId}, ${tx.json({ intentId })}, ${row.expiresAt})
+      `;
+      if (row.governance === "squads") await tx`
+        insert into outbox_events (organization_id, topic, aggregate_type, aggregate_id, payload)
+        values (${row.organizationId}, 'proposal.observe', 'intent', ${intentId}, ${tx.json({ intentId })})
+      `;
+    });
+  }
+
+  /**
+   * Reads on-chain votes into approvals. The chain's own threshold decides;
+   * the database only mirrors it and schedules the next look.
+   */
+  async observeProposal(intentId: string, observe: Observer): Promise<void> {
+    const rows = await this.sql<{ organizationId: string; status: string; version: number; requestStatus: string; externalRef: Record<string, unknown> | null; expiresAt: string; chainFamily: "evm" | "svm"; network: string; treasuryConfiguration: Record<string, unknown> }[]>`
+      select i.organization_id::text as "organizationId", i.status, i.version, ar.status as "requestStatus", ar.external_ref as "externalRef", ar.expires_at::text as "expiresAt",
+        t.chain_family as "chainFamily", i.network, t.observed_configuration as "treasuryConfiguration"
+      from intents i join approval_requests ar on ar.intent_id = i.id join treasury_accounts t on t.id = i.treasury_account_id where i.id = ${intentId}
+    `;
+    const row = rows[0];
+    if (!row) throw new Error("Intent not found");
+    if (row.status !== "approval_required" || row.requestStatus !== "pending" || !row.externalRef) return;
+    const observation = await observe({ organizationId: row.organizationId, chainFamily: row.chainFamily, network: row.network, externalRef: row.externalRef, treasuryConfiguration: row.treasuryConfiguration ?? {} });
+    if (!observation) throw new Deferred("Proposal account not yet visible", 3);
+    const wallets = await this.sql<{ address: string; principalId: string }[]>`
+      select address, principal_id::text as "principalId" from human_wallets where organization_id = ${row.organizationId} and chain_family = ${row.chainFamily}
+    `;
+    const principalFor = (address: string) => wallets.find((wallet) => (row.chainFamily === "evm" ? wallet.address.toLowerCase() === address.toLowerCase() : wallet.address === address))?.principalId ?? null;
+    await this.sql.begin(async (tx) => {
+      const locked = await tx<{ status: string; version: number }[]>`select status, version from intents where id = ${intentId} for update`;
+      if (locked[0]?.status !== "approval_required") return;
+      for (const [decision, addresses] of [["approved", observation.approved], ["rejected", observation.rejected]] as const) {
+        for (const address of addresses) {
+          await tx`
+            insert into approvals (organization_id, intent_id, approver_principal_id, decision, signer_address, signed_payload)
+            values (${row.organizationId}, ${intentId}, ${principalFor(address)}, ${decision}, ${address}, 'on-chain vote')
+            on conflict (intent_id, signer_address) where signer_address is not null do nothing
+          `;
+        }
+      }
+      if (observation.status === "approved") {
+        await tx`update approval_requests set status = 'approved', updated_at = now() where intent_id = ${intentId}`;
+        await this.transition(tx, intentId, row.organizationId, locked[0].version, "approval_required", "approved", "intent.approved", { onChain: true, approved: observation.approved });
+        await tx`
+          insert into outbox_events (organization_id, topic, aggregate_type, aggregate_id, payload)
+          values (${row.organizationId}, 'transaction.execute', 'intent', ${intentId}, ${tx.json({ intentId })})
+        `;
+        return;
+      }
+      if (observation.status === "rejected" || observation.status === "cancelled") {
+        await tx`update approval_requests set status = 'rejected', updated_at = now() where intent_id = ${intentId}`;
+        await tx`update intents set failure_reason = ${`Proposal ${observation.status} on chain`} where id = ${intentId}`;
+        await this.transition(tx, intentId, row.organizationId, locked[0].version, "approval_required", "rejected", "intent.rejected", { onChain: true, rejected: observation.rejected });
+        return;
+      }
+      if (new Date(row.expiresAt) > new Date()) {
+        await tx`
+          insert into outbox_events (organization_id, topic, aggregate_type, aggregate_id, payload, available_at)
+          values (${row.organizationId}, 'proposal.observe', 'intent', ${intentId}, ${tx.json({ intentId })}, now() + interval '5 seconds')
+        `;
+      }
+    });
+  }
+
   async expireApproval(intentId: string): Promise<void> {
     await this.sql.begin(async (tx) => {
       const rows = await tx<{ organizationId: string; status: string; version: number; requestStatus: string; expiresAt: string }[]>`
@@ -370,17 +544,18 @@ export class PostgresJobQueue {
    */
   async getExecutionContext(intentId: string): Promise<ExecutionContext> {
     const explicit = await this.sql.unsafe<(IntentRow & {
-      signerId: string | null; signerStatus: string | null; encryptedSecret: string | null; encryptionNonce: string | null; authTag: string | null; keyVersion: number | null;
-      approvalStatus: string | null; approvalCompiledHash: string | null;
+      signerId: string | null; signerAddress: string | null; signerStatus: string | null; encryptedSecret: string | null; encryptionNonce: string | null; authTag: string | null; keyVersion: number | null;
+      approvalStatus: string | null; approvalCompiledHash: string | null; externalRef: Record<string, unknown> | null;
       executionId: string | null; executionStatus: string | null; transactionHash: string | null; signedPayload: string | null; nonce: string | null; validUntil: string | null;
     })[]>(`
-      select base.*, sg."signerId", sg."signerStatus", sg."encryptedSecret", sg."encryptionNonce", sg."authTag", sg."keyVersion",
-        ar.status as "approvalStatus", ar.compiled_hash as "approvalCompiledHash",
+      select base.*, sg."signerId", sg."signerAddress", sg."signerStatus", sg."encryptedSecret", sg."encryptionNonce", sg."authTag", sg."keyVersion",
+        ar.status as "approvalStatus", ar.compiled_hash as "approvalCompiledHash", ar.external_ref as "externalRef",
         e.id::text as "executionId", e.status as "executionStatus", e.transaction_hash as "transactionHash", e.signed_payload as "signedPayload", e.nonce, e.valid_until as "validUntil"
       from (${intentJoin} where i.id = $1) base
       left join lateral (
-        select s.id::text as "signerId", s.status as "signerStatus", s.encrypted_secret as "encryptedSecret", s.encryption_nonce as "encryptionNonce", s.auth_tag as "authTag", s.key_version as "keyVersion"
-        from signers s where s.organization_id = base."organizationId"::uuid and s.chain_family = base."chainFamily" and lower(s.address) = lower(base."from") and s.custody = 'encrypted_software'
+        select s.id::text as "signerId", s.address as "signerAddress", s.status as "signerStatus", s.encrypted_secret as "encryptedSecret", s.encryption_nonce as "encryptionNonce", s.auth_tag as "authTag", s.key_version as "keyVersion"
+        from signers s where s.organization_id = base."organizationId"::uuid and s.custody = 'encrypted_software' and s.chain_family = base."chainFamily"
+          and ((base.governance = 'direct' and lower(s.address) = lower(base."from")) or (base.governance <> 'direct' and s.id = base."executorSignerId"::uuid))
         order by s.created_at desc limit 1
       ) sg on true
       left join approval_requests ar on ar.intent_id = base."intentId"::uuid
@@ -391,10 +566,9 @@ export class PostgresJobQueue {
     if (!["approved", "executing"].includes(row.status)) throw new Error(`Intent is ${row.status}, not approved`);
     if (row.approvalStatus !== "approved" || !row.approvalCompiledHash) throw new ExecutionRejected("No approved approval request");
     if (row.status === "executing" && !row.executionId) throw new ExecutionRejected("Intent is executing without an execution record");
-    if (row.governance !== "direct") throw new Error(`Governance ${row.governance} requires its dedicated adapter`);
     const gate = this.gate(row);
     if (gate) throw new ExecutionRejected(gate);
-    if (!row.signerId || !row.encryptedSecret || !row.encryptionNonce || !row.authTag || row.keyVersion === null) throw new ExecutionRejected("No encrypted signer matches the treasury address");
+    if (!row.signerId || !row.signerAddress || !row.encryptedSecret || !row.encryptionNonce || !row.authTag || row.keyVersion === null) throw new ExecutionRejected(row.governance === "direct" ? "No encrypted signer matches the treasury address" : "Treasury has no executor signer");
     if (row.signerStatus !== "active") throw new ExecutionRejected(`Signer is ${row.signerStatus}`);
     if (row.status === "approved" && new Date(row.expiresAt) <= new Date()) throw new ExecutionRejected("Intent expired before execution");
     if (row.status === "approved") {
@@ -406,12 +580,15 @@ export class PostgresJobQueue {
         if (decision.outcome === "rejected") throw new ExecutionRejected(`Policy rejected at execution: ${decision.reasons.join("; ")}`);
       }
     }
+    const ownerSignatures = row.governance === "safe"
+      ? await this.sql<{ signerAddress: string; signedPayload: string }[]>`select signer_address as "signerAddress", signed_payload as "signedPayload" from approvals where intent_id = ${intentId} and decision = 'approved' and signer_address is not null and signed_payload is not null`
+      : [];
     return {
       intentId, organizationId: row.organizationId, treasuryId: row.treasuryId, network: row.network, chainFamily: row.chainFamily, governance: row.governance,
       from: row.from, to: row.destination, assetId: row.assetId, asset: { id: row.assetId, kind: row.assetKind!, address: row.assetAddress, decimals: row.assetDecimals! },
       amountBaseUnits: row.amountBaseUnits, intentStatus: row.status, intentVersion: row.version,
-      signerId: row.signerId, encryptedSecret: row.encryptedSecret, encryptionNonce: row.encryptionNonce, authTag: row.authTag, keyVersion: row.keyVersion,
-      approvalCompiledHash: row.approvalCompiledHash,
+      signerId: row.signerId, signerAddress: row.signerAddress, encryptedSecret: row.encryptedSecret, encryptionNonce: row.encryptionNonce, authTag: row.authTag, keyVersion: row.keyVersion,
+      approvalCompiledHash: row.approvalCompiledHash, externalRef: row.externalRef, treasuryConfiguration: row.observedConfiguration ?? {}, ownerSignatures,
       execution: row.executionId ? { id: row.executionId, status: row.executionStatus!, transactionHash: row.transactionHash, signedPayload: row.signedPayload, nonce: row.nonce, validUntil: row.validUntil } : null
     };
   }

@@ -66,6 +66,7 @@ up() {
       --clone-upgradeable-program $SQUADS_PROGRAM \
       --maybe-clone $SQUADS_CONFIG \
       --maybe-clone $SQUADS_TREASURY \
+      --limit-ledger-size 20000 \
       --reset --quiet >"$LOCAL/validator.log" 2>&1 &
     echo $! >"$LOCAL/validator.pid"
     echo "solana-test-validator started on :$SOL_RPC (pid $!)"

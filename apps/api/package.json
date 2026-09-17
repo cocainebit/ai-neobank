@@ -9,7 +9,7 @@
     "start": "node dist/server.js",
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test:integration": "RUN_API_INTEGRATION=1 vitest run src/app.test.ts"
+    "test:integration": "RUN_API_INTEGRATION=1 vitest run src/app.test.ts src/governance.test.ts"
   },
   "dependencies": {
     "@ai-neobank/domain": "workspace:*",
@@ -23,7 +23,10 @@
     "@ai-neobank/chain-core": "workspace:*",
     "@ai-neobank/evm-adapter": "workspace:*",
     "@ai-neobank/solana-adapter": "workspace:*",
-    "@fastify/cookie": "^11.0.2"
+    "@fastify/cookie": "^11.0.2",
+    "@ai-neobank/safe-adapter": "workspace:*",
+    "@ai-neobank/squads-adapter": "workspace:*",
+    "@solana/web3.js": "^1.98.4"
   },
   "devDependencies": {
     "tsx": "^4.20.5",

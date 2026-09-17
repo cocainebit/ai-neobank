@@ -23,6 +23,7 @@ import {
   recoverTransactionAddress,
   type Address,
   type Hex,
+  type LocalAccount,
   type TransactionSerialized
 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
@@ -119,14 +120,15 @@ export class EvmAdapter implements ChainAdapter {
   }
 
   /** Signs without sending. The returned hash is the keccak of the signed bytes, so it is known before broadcast. */
-  async signTransfer(request: TransferRequest, privateKey: Hex): Promise<SignedTransaction> {
+  async signTransfer(request: TransferRequest, signer: Hex | LocalAccount): Promise<SignedTransaction> {
     assertPositiveTransfer(request);
-    return this.signCall({ from: request.from, ...this.call(request) }, privateKey);
+    return this.signCall({ from: request.from, ...this.call(request) }, signer);
   }
 
   /** Signs an arbitrary call from the key's account, for example a Safe execTransaction. */
-  async signCall(call: { from: string; to: string; value?: bigint; data?: Hex }, privateKey: Hex): Promise<SignedTransaction> {
-    const account = privateKeyToAccount(privateKey);
+  async signCall(call: { from: string; to: string; value?: bigint; data?: Hex }, signer: Hex | LocalAccount): Promise<SignedTransaction> {
+    // A raw key for development signers, or an account whose key lives elsewhere (KMS).
+    const account = typeof signer === "string" ? privateKeyToAccount(signer) : signer;
     if (account.address.toLowerCase() !== call.from.toLowerCase()) {
       throw new Error("Signer does not match call sender");
     }

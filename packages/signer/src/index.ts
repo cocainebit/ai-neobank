@@ -57,3 +57,22 @@ export function exportDevelopmentSecret(signer: GeneratedSigner): string {
     ? `0x${Buffer.from(signer.secret).toString("hex")}`
     : Buffer.from(signer.secret).toString("base64");
 }
+
+export {
+  ChainedKeyProvider,
+  LocalKeyring,
+  KmsKeyProvider,
+  awsKmsClient,
+  evmAddressFromSpki,
+  kmsEvmAccount,
+  openSecret,
+  parseDerSignature,
+  parseKeyring,
+  rewrapSecret,
+  sealSecret,
+  secp256k1PointFromSpki,
+  type KeyEncryptionProvider,
+  type KmsClient,
+  type SealedSecret
+} from "./kms.js";
+export { keyConfigurationFromEnv, type KeyConfiguration } from "./config.js";

@@ -3,6 +3,8 @@ import {
   Deferred,
   ExecutionRejected,
   OperationsStore,
+  RotationStore,
+  type PostgresControlPlaneStore,
   type ExecutionContext,
   type JobRecord,
   type PostgresJobQueue,
@@ -16,13 +18,20 @@ import { SolanaAdapter } from "@ai-neobank/solana-adapter";
 import { SafeGovernanceAdapter, recoverSafeSigner, type CompiledSafeTransaction, type SafeContractAddresses } from "@ai-neobank/safe-adapter";
 import { SquadsGovernanceAdapter } from "@ai-neobank/squads-adapter";
 import { X402PaymentClient, X402QuoteError, solanaWireNetwork, type PaymentPayload, type X402Quote } from "@ai-neobank/x402-adapter";
-import { decryptSecret } from "@ai-neobank/signer";
+import { LocalKeyring, kmsEvmAccount, openSecret, rewrapSecret, type KeyEncryptionProvider, type KmsClient } from "@ai-neobank/signer";
+import type { SignerKeyMaterial } from "@ai-neobank/database";
 import { Keypair, PublicKey } from "@solana/web3.js";
 import { createHash } from "node:crypto";
-import type { Hex } from "viem";
+import type { Hex, LocalAccount } from "viem";
+import { privateKeyToAccount } from "viem/accounts";
 
 export interface WorkerChainConfig {
-  signerMasterKey: Uint8Array;
+  /** Legacy single master key; equivalent to a keyring holding only version "1". */
+  signerMasterKey?: Uint8Array;
+  /** Key-encryption provider for software signers' data keys (local keyring or KMS). */
+  keys?: KeyEncryptionProvider;
+  /** KMS used by signers whose private key never leaves it. */
+  kms?: KmsClient;
   evm?: { network: `eip155:${number}`; chainId: number; rpcUrl: string; confirmations?: number; safeContracts?: SafeContractAddresses };
   solana?: { network: `solana:${string}`; rpcUrl: string; finality?: "confirmed" | "finalized"; /** CAIP-2 id on the x402 wire; derived from the genesis hash when omitted. */ x402Network?: string };
 }
@@ -32,12 +41,20 @@ interface ExecutionPlan {
   feeBaseUnits: bigint;
   compiledPayload: Record<string, unknown>;
   compiledHash: string;
-  sign(secret: Uint8Array): Promise<SignedTransaction>;
+  sign(keys: SigningKeys): Promise<SignedTransaction>;
   broadcast(signed: SignedTransaction): Promise<Settlement | void>;
   recover(signed: SignedTransaction): Promise<{ outcome: "resend" } | { outcome: "settled"; settlement?: Settlement } | { outcome: "dead"; reason: string }>;
 }
 
 interface Settlement { transactionHash: string; payTo: string; amountBaseUnits: string; observed?: Record<string, unknown> }
+
+/** Whatever signs for this execution: an EVM account (local key or KMS) or a Solana keypair. */
+export interface SigningKeys {
+  evm(): LocalAccount;
+  solana(): Keypair;
+  /** Raw secret bytes, for SDKs that need them (x402 Solana); absent for KMS custody. */
+  secret(): Uint8Array;
+}
 
 export interface WorkerOptions {
   /** Periodic work: chain sync for every active treasury on a configured network, and recurring payments. Off unless set. */
@@ -76,11 +93,13 @@ function directCompiledHash(context: { intentId: string; network: string; assetI
 
 export class DurableWorker {
   private readonly operations: OperationsStore;
+  private readonly rotations: RotationStore;
   private lastSyncEnqueue = 0;
   private lastScheduleEnqueue = 0;
 
   constructor(private readonly queue: PostgresJobQueue, private readonly chainConfig?: WorkerChainConfig, private readonly workerId = crypto.randomUUID(), private readonly hooks: WorkerHooks = {}, private readonly options: WorkerOptions = {}) {
     this.operations = new OperationsStore(queue.sql);
+    this.rotations = new RotationStore(queue.sql);
   }
 
   /** Enqueues periodic jobs once per interval bucket; dedupe keys keep several workers from doubling them. */
@@ -138,6 +157,20 @@ export class DurableWorker {
 
   private async handle(job: JobRecord): Promise<void> {
     if (job.type === "schedules.enqueue") { await this.enqueueSchedules(); return; }
+    if (job.type.startsWith("rotation.")) {
+      const rotationId = job.payload.rotationId;
+      if (typeof rotationId !== "string") throw new Error(`${job.type} requires rotationId`);
+      try {
+        if (job.type === "rotation.publish") await this.publishRotation(rotationId);
+        else if (job.type === "rotation.observe") await this.observeRotation(rotationId);
+        else if (job.type === "rotation.execute") await this.executeRotation(rotationId);
+        else throw new Error(`No handler registered for ${job.type}`);
+      } catch (error) {
+        if (error instanceof ExecutionRejected) { await this.rotations.fail(rotationId, error.message); return; }
+        throw error;
+      }
+      return;
+    }
     if (job.type === "treasury.sync") {
       const treasuryId = job.payload.treasuryId;
       if (typeof treasuryId !== "string") throw new Error("treasury.sync requires treasuryId");
@@ -197,9 +230,34 @@ export class DurableWorker {
     return this.x402Cache;
   }
 
-  private decrypt(context: { encryptedSecret: string; encryptionNonce: string; authTag: string; keyVersion: number }): Uint8Array {
-    if (!this.chainConfig) throw new Error("Chain execution is not configured");
-    return decryptSecret({ ciphertext: context.encryptedSecret, nonce: context.encryptionNonce, authTag: context.authTag, keyVersion: context.keyVersion }, this.chainConfig.signerMasterKey);
+  private keyProvider(): KeyEncryptionProvider {
+    if (this.chainConfig?.keys) return this.chainConfig.keys;
+    if (this.chainConfig?.signerMasterKey) return new LocalKeyring({ "1": this.chainConfig.signerMasterKey }, "1");
+    throw new Error("No signer key provider is configured");
+  }
+
+  /**
+   * Opens the signer for one use. Software secrets are zeroed when `use`
+   * returns; KMS custody never brings key material into the process.
+   */
+  private async withSigner<T>(key: SignerKeyMaterial, chainFamily: "evm" | "svm", use: (keys: SigningKeys) => Promise<T>): Promise<T> {
+    if (key.custody === "kms") {
+      if (chainFamily !== "evm") throw new ExecutionRejected("KMS custody signs EVM transactions only");
+      if (!this.chainConfig?.kms || !key.kmsKeyId) throw new Error("KMS is not configured for this worker");
+      const account = await kmsEvmAccount(this.chainConfig.kms, key.kmsKeyId);
+      const unavailable = (): never => { throw new ExecutionRejected("This operation needs a key held outside KMS"); };
+      return use({ evm: () => account, solana: unavailable, secret: unavailable });
+    }
+    const secret = await openSecret({ ciphertext: key.encryptedSecret!, nonce: key.encryptionNonce!, authTag: key.authTag!, keyVersion: key.keyVersion, dataKey: key.dataKey, dataKeyVersion: key.dataKeyVersion }, this.keyProvider());
+    try {
+      return await use({
+        evm: () => privateKeyToAccount(`0x${Buffer.from(secret).toString("hex")}`),
+        solana: () => Keypair.fromSecretKey(secret),
+        secret: () => secret
+      });
+    } finally {
+      secret.fill(0);
+    }
   }
 
   // Intake simulation
@@ -281,9 +339,7 @@ export class DurableWorker {
     const proposal = await squads.prepareProposal(multisigPda, executor, transactionIndex, context.to, squadsAsset(context.asset), amount, `relay:${intentId}`);
     if (!alreadyPublished) {
       await this.queue.recordPublication(intentId, { multisigPda, transactionIndex: transactionIndex.toString(), proposalPda: proposal.ref.proposalPda, executor: context.executorAddress });
-      const secret = this.decrypt(context);
-      let signed: SignedTransaction;
-      try { signed = await this.solana(context.network).signInstructions(proposal.instructions, Keypair.fromSecretKey(secret)); } finally { secret.fill(0); }
+      const signed = await this.withSigner(context.key, "svm", (keys) => this.solana(context.network).signInstructions(proposal.instructions, keys.solana()));
       await this.solana(context.network).broadcast(signed);
       await squads.waitFor(signed.hash);
     }
@@ -327,13 +383,7 @@ export class DurableWorker {
     }
 
     const executionId = context.execution?.id ?? await this.queue.recordSimulation(context, build.feeBaseUnits, build.compiledPayload, build.compiledHash);
-    const secret = this.decrypt(context);
-    let signed: SignedTransaction;
-    try {
-      signed = await build.sign(secret);
-    } finally {
-      secret.fill(0);
-    }
+    const signed = await this.withSigner(context.key, context.chainFamily, (keys) => build.sign(keys));
     await this.queue.markSigned(executionId, signed);
     if (this.hooks.beforeBroadcast) await this.hooks.beforeBroadcast(context, signed);
     const settlement = await build.broadcast(signed);
@@ -368,9 +418,9 @@ export class DurableWorker {
         feeBaseUnits: simulation.feeBaseUnits,
         compiledPayload: { kind: `${context.asset.kind}_transfer`, network: context.network, from: context.from, to: context.to, assetId: context.assetId, amountBaseUnits: context.amountBaseUnits },
         compiledHash,
-        sign: (secret) => context.chainFamily === "evm"
-          ? (adapter as EvmAdapter).signTransfer(request, `0x${Buffer.from(secret).toString("hex")}`)
-          : (adapter as SolanaAdapter).signTransfer(request, Keypair.fromSecretKey(secret)),
+        sign: (keys) => context.chainFamily === "evm"
+          ? (adapter as EvmAdapter).signTransfer(request, keys.evm())
+          : (adapter as SolanaAdapter).signTransfer(request, keys.solana()),
         ...this.chainDelivery(adapter)
       };
     }
@@ -397,7 +447,7 @@ export class DurableWorker {
         feeBaseUnits: simulation.feeBaseUnits,
         compiledPayload: { kind: "safe_exec_transaction", network: context.network, safe: context.from, to: context.to, assetId: context.assetId, amountBaseUnits: context.amountBaseUnits, safeTxHash: compiled.safeTxHash, nonce: compiled.nonce, signers: signatures.map((entry) => entry.owner) },
         compiledHash: context.approvalCompiledHash,
-        sign: (secret) => evm.signCall({ from: context.signerAddress, to: context.from, data }, `0x${Buffer.from(secret).toString("hex")}` as Hex),
+        sign: (keys) => evm.signCall({ from: context.signerAddress, to: context.from, data }, keys.evm()),
         ...this.chainDelivery(evm)
       };
     }
@@ -416,7 +466,7 @@ export class DurableWorker {
       feeBaseUnits: simulation.feeBaseUnits,
       compiledPayload: { kind: "squads_vault_transaction_execute", network: context.network, multisigPda: ref.multisigPda, transactionIndex: ref.transactionIndex, to: context.to, assetId: context.assetId, amountBaseUnits: context.amountBaseUnits, approved: proposal.approved },
       compiledHash: context.approvalCompiledHash,
-      sign: (secret) => solana.signInstructions([execute.instruction], Keypair.fromSecretKey(secret), [], execute.lookupTableAccounts),
+      sign: (keys) => solana.signInstructions([execute.instruction], keys.solana(), [], execute.lookupTableAccounts),
       ...this.chainDelivery(solana)
     };
   }
@@ -449,8 +499,8 @@ export class DurableWorker {
       feeBaseUnits: 0n,
       compiledPayload: { kind: "x402_exact", network: context.network, url: quote.url, method: quote.method, payTo: quote.requirements.payTo, settledAmountBaseUnits: quote.requirements.amount, assetId: context.assetId, wireNetwork: quote.requirements.network },
       compiledHash: context.approvalCompiledHash,
-      sign: async (secret) => {
-        const payload = await client.createPayload(quote, context.chainFamily === "evm" ? { evmPrivateKey: `0x${Buffer.from(secret).toString("hex")}` as Hex } : { solanaSecretKey: secret });
+      sign: async (keys) => {
+        const payload = await client.createPayload(quote, context.chainFamily === "evm" ? { evmAccount: keys.evm() } : { solanaSecretKey: keys.secret() });
         return { hash: X402PaymentClient.payloadId(payload), raw: JSON.stringify(payload), nonce: "", validUntil: "" };
       },
       broadcast: async (signed) => {
@@ -470,6 +520,61 @@ export class DurableWorker {
         return settled ? { outcome: "settled", settlement: settled } : { outcome: "resend" };
       }
     };
+  }
+
+  // Executor rotation (Squads): the current executor proposes swapping itself for the new signer; members approve on chain.
+
+  private async publishRotation(rotationId: string): Promise<void> {
+    const rotation = await this.rotations.context(rotationId);
+    if (rotation.status !== "publishing") return;
+    if (rotation.governance !== "squads") throw new ExecutionRejected("Only Squads rotations need an on-chain proposal");
+    const multisigPda = String(rotation.treasuryConfiguration.multisigPda ?? "");
+    const squads = this.squads(rotation.network);
+    const observed = await squads.observe(multisigPda);
+    if (!observed.members.some((member) => member.key === rotation.fromAddress && member.canInitiate)) throw new ExecutionRejected("The current executor is no longer a member that can propose");
+    let transactionIndex = observed.transactionIndex + 1n;
+    const previous = rotation.publication?.transactionIndex ? BigInt(String(rotation.publication.transactionIndex)) : null;
+    let alreadyPublished = false;
+    if (previous !== null) {
+      if (await squads.configPublishedBy(multisigPda, previous, rotation.fromAddress)) { transactionIndex = previous; alreadyPublished = true; }
+      else if (previous > observed.transactionIndex) transactionIndex = previous;
+    }
+    const proposal = squads.prepareMemberSwap(multisigPda, new PublicKey(rotation.fromAddress), transactionIndex, { key: rotation.toAddress, role: "executor" }, rotation.fromAddress, `relay:rotation:${rotationId}`);
+    if (!alreadyPublished) {
+      await this.rotations.recordPublication(rotationId, { multisigPda, transactionIndex: transactionIndex.toString() });
+      const signed = await this.withSigner(rotation.fromKey, "svm", (keys) => this.solana(rotation.network).signInstructions(proposal.instructions, keys.solana()));
+      await this.solana(rotation.network).broadcast(signed);
+      await squads.waitFor(signed.hash);
+    }
+    await this.rotations.published(rotationId, { kind: "squads_config", ...proposal.ref, threshold: observed.threshold, adds: rotation.toAddress, removes: rotation.fromAddress });
+  }
+
+  private async observeRotation(rotationId: string): Promise<void> {
+    const rotation = await this.rotations.context(rotationId);
+    if (rotation.status !== "approval_required" || !rotation.externalRef) return;
+    const proposal = await this.squads(rotation.network).observeProposal(String(rotation.externalRef.multisigPda), BigInt(String(rotation.externalRef.transactionIndex)));
+    if (!proposal) throw new Deferred("Rotation proposal not yet visible", 3);
+    const outcome = proposal.status === "approved" ? "approved" : proposal.status === "rejected" || proposal.status === "cancelled" ? "rejected" : "pending";
+    await this.rotations.observed(rotationId, outcome);
+  }
+
+  private async executeRotation(rotationId: string): Promise<void> {
+    const rotation = await this.rotations.context(rotationId);
+    if (rotation.status !== "executing" || !rotation.externalRef) return;
+    const multisigPda = String(rotation.externalRef.multisigPda);
+    const squads = this.squads(rotation.network);
+    const membersNow = async () => (await squads.observe(multisigPda)).members;
+    const swapped = (members: Awaited<ReturnType<typeof membersNow>>) => members.some((member) => member.key === rotation.toAddress) && !members.some((member) => member.key === rotation.fromAddress);
+    // A retry after a crash may find the config change already applied.
+    if (!swapped(await membersNow())) {
+      const instruction = squads.prepareConfigExecute(multisigPda, BigInt(String(rotation.externalRef.transactionIndex)), new PublicKey(rotation.fromAddress));
+      const signed = await this.withSigner(rotation.fromKey, "svm", (keys) => this.solana(rotation.network).signInstructions([instruction], keys.solana()));
+      await this.solana(rotation.network).broadcast(signed);
+      await squads.waitFor(signed.hash);
+    }
+    const members = await membersNow();
+    if (!swapped(members)) throw new Error("Config transaction executed but the member set did not change");
+    await this.rotations.complete(rotationId, { members });
   }
 
   /** Creates intents for recurring payments that are due. */
@@ -555,6 +660,35 @@ export class DurableWorker {
     if (!receipt.finalized) throw new Deferred(`Awaiting finality (${receipt.confirmations} confirmations)`, 3);
     await this.queue.markFinalized(context, receipt);
   }
+}
+
+/**
+ * Re-wraps every software signer's data key under the provider's active key.
+ * Legacy envelopes sealed directly under a master key are upgraded to format 2.
+ * Envelopes the provider cannot open are counted and left untouched, so one
+ * bad row never blocks the rest. Safe to run repeatedly and concurrently; a
+ * row is replaced only if it is unchanged since it was read.
+ */
+export async function rotateKeyEncryption(store: PostgresControlPlaneStore, provider: KeyEncryptionProvider, options: { batchSize?: number; organizationId?: string; onProgress?: (done: number) => void } = {}): Promise<{ rewrapped: number; failed: { signerId: string; reason: string }[] }> {
+  let rewrapped = 0;
+  const failed: { signerId: string; reason: string }[] = [];
+  let afterId: string | undefined;
+  for (;;) {
+    const batch = await store.listSignersToRewrap(provider.activeVersion, { limit: options.batchSize ?? 100, ...(afterId ? { afterId } : {}), ...(options.organizationId ? { organizationId: options.organizationId } : {}) });
+    if (batch.length === 0) break;
+    for (const signer of batch) {
+      afterId = signer.id;
+      try {
+        if (!signer.encryptedSecret || !signer.encryptionNonce || !signer.authTag) throw new Error("Envelope is incomplete");
+        const sealed = await rewrapSecret({ ciphertext: signer.encryptedSecret, nonce: signer.encryptionNonce, authTag: signer.authTag, keyVersion: signer.keyVersion, dataKey: signer.dataKey, dataKeyVersion: signer.dataKeyVersion }, provider);
+        if (await store.replaceSignerEnvelope(signer.id, { dataKey: signer.dataKey, encryptedSecret: signer.encryptedSecret }, sealed)) rewrapped += 1;
+      } catch (error) {
+        failed.push({ signerId: signer.id, reason: error instanceof Error ? error.message : String(error) });
+      }
+      options.onProgress?.(rewrapped);
+    }
+  }
+  return { rewrapped, failed };
 }
 
 export function createWorker(databaseUrl: string, chainConfig?: WorkerChainConfig, hooks?: WorkerHooks, options?: WorkerOptions): { worker: DurableWorker; queue: PostgresJobQueue; close: () => Promise<void> } {

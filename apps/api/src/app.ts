@@ -1,12 +1,12 @@
 import Fastify, { type FastifyReply, type FastifyRequest } from "fastify";
 import cookie from "@fastify/cookie";
 import cors from "@fastify/cors";
-import { ApprovalError, OperationsStore, type PostgresControlPlaneStore, type PostgresJobQueue, type SessionRecord } from "@ai-neobank/database";
+import { ApprovalError, OperationsError, OperationsStore, RotationStore, type PostgresControlPlaneStore, type PostgresJobQueue, type SessionRecord } from "@ai-neobank/database";
 import type { FacilitatorClient } from "@x402/core/server";
 import { registerOperationsRoutes } from "./operations-routes.js";
 import { paymentIntentSchema, policyDefinitionSchema, spendingPolicySchema, tokenAssetId, type PrincipalRole } from "@ai-neobank/domain";
 import { evaluatePaymentIntent } from "@ai-neobank/policy";
-import { encryptSecret, exportDevelopmentSecret, generateSigner } from "@ai-neobank/signer";
+import { LocalKeyring, evmAddressFromSpki, exportDevelopmentSecret, generateSigner, sealSecret, type KeyEncryptionProvider, type KmsClient } from "@ai-neobank/signer";
 import {
   buildApprovalMessage,
   buildSignInMessage,
@@ -37,7 +37,12 @@ export interface AppOptions {
   auth: { domain: string; uri: string; sessionTtlSeconds?: number; secureCookies?: boolean };
   /** Browser origin allowed to call with cookies. */
   webOrigin?: string;
+  /** Legacy single master key; treated as a keyring holding version "1". */
   signerMasterKey?: Uint8Array;
+  /** Seals software signers' data keys (local keyring or KMS). */
+  keys?: KeyEncryptionProvider;
+  /** Enables signers whose private key never leaves KMS. */
+  kms?: KmsClient;
   allowSoftwareSigners?: boolean;
   chains?: {
     evm?: { network: `eip155:${number}`; chainId: number; rpcUrl: string; confirmations?: number; safeContracts?: SafeContractAddresses };
@@ -131,6 +136,10 @@ function invalid(reply: FastifyReply, details: unknown) {
 export function buildApp(options: AppOptions) {
   const app = Fastify({ logger: options.logger ?? true });
   const { store, queue } = options;
+  const keyProvider: KeyEncryptionProvider | null = options.keys ?? (options.signerMasterKey ? new LocalKeyring({ "1": options.signerMasterKey }, "1") : null);
+  /** Whether data keys are wrapped outside this process, which production requires for software signers. */
+  const keysHeldByKms = keyProvider?.holdsKeysOutsideProcess ?? false;
+  const rotations = new RotationStore(store.sql);
   const operations = new OperationsStore(store.sql);
   const sessionTtl = options.auth.sessionTtlSeconds ?? 12 * 60 * 60;
   const allowedOrigins = new Set([options.webOrigin, options.auth.uri].filter((value): value is string => Boolean(value)).map((value) => new URL(value).origin));
@@ -242,7 +251,8 @@ export function buildApp(options: AppOptions) {
         safe: safeAdapter ? "e2e_local" : "not_configured",
         squads: squadsAdapter ? "e2e_local" : "not_configured",
         x402: evmAdapter || solanaAdapter ? "e2e_local" : "not_configured",
-        softwareSigners: options.allowSoftwareSigners && options.signerMasterKey ? "enabled_development_only" : "disabled"
+        softwareSigners: !options.allowSoftwareSigners || !keyProvider ? "disabled" : keysHeldByKms ? "enabled_kms_wrapped" : "enabled_local_keyring",
+        kmsSigners: options.kms ? "enabled" : "disabled"
       }
     });
   });
@@ -584,13 +594,16 @@ export function buildApp(options: AppOptions) {
     const auth = human(request, reply, ["owner"]); if (!auth) return;
     const body = signerSchema.safeParse(request.body);
     if (!body.success) return invalid(reply, body.error.flatten());
-    if (options.environment === "production" || !options.allowSoftwareSigners || !options.signerMasterKey) {
-      return reply.code(503).send({ error: "software_signers_disabled", message: "Encrypted software signers are a local development harness. Production custody is Safe, Squads, or an HSM/KMS signer." });
+    if (!options.allowSoftwareSigners || !keyProvider) {
+      return reply.code(503).send({ error: "software_signers_disabled", message: "Configure a signer keyring or KMS data key, or use a KMS-held signer." });
+    }
+    if (options.environment === "production" && !keysHeldByKms) {
+      return reply.code(503).send({ error: "software_signers_need_kms", message: "In production, software signers' data keys must be wrapped by KMS. Use a KMS-held signer or configure KMS_DATA_KEY_ID." });
     }
     if (body.data.revealDevelopmentSecret && options.environment !== "development") return reply.code(403).send({ error: "secret_export_disabled_outside_development" });
     const generated = generateSigner(body.data.chainFamily);
-    const encrypted = encryptSecret(generated.secret, options.signerMasterKey);
-    const created = await store.createSigner(auth.organizationId, { ...(body.data.agentId ? { agentId: body.data.agentId } : {}), chainFamily: generated.family, address: generated.address, encryptedSecret: encrypted.ciphertext, encryptionNonce: encrypted.nonce, authTag: encrypted.authTag, keyVersion: encrypted.keyVersion }, auth.principalId);
+    const sealed = await sealSecret(generated.secret, keyProvider);
+    const created = await store.createSigner(auth.organizationId, { ...(body.data.agentId ? { agentId: body.data.agentId } : {}), chainFamily: generated.family, address: generated.address, encryptedSecret: sealed.ciphertext, encryptionNonce: sealed.nonce, authTag: sealed.authTag, dataKey: sealed.dataKey, dataKeyVersion: sealed.dataKeyVersion }, auth.principalId);
     const response: Record<string, unknown> = { data: created };
     if (body.data.revealDevelopmentSecret) {
       response.developmentSecret = exportDevelopmentSecret(generated);
@@ -598,6 +611,61 @@ export function buildApp(options: AppOptions) {
     }
     generated.secret.fill(0);
     return reply.code(201).send(response);
+  });
+
+  /** Registers an EVM signer held in KMS: the address is derived from the KMS public key, and the key never leaves KMS. */
+  app.post("/v1/signers/kms", async (request, reply) => {
+    const auth = human(request, reply, ["owner"]); if (!auth) return;
+    const body = z.object({ chainFamily: z.literal("evm"), kmsKeyId: z.string().min(1).max(2048), agentId: uuid.optional() }).safeParse(request.body);
+    if (!body.success) return invalid(reply, body.error.flatten());
+    if (!options.kms) return reply.code(503).send({ error: "kms_not_configured" });
+    let address: string;
+    try {
+      address = evmAddressFromSpki(await options.kms.getPublicKey(body.data.kmsKeyId));
+    } catch (error) {
+      return reply.code(422).send({ error: "kms_key_unusable", message: error instanceof Error ? error.message : "KMS key could not be read" });
+    }
+    const created = await store.createKmsSigner(auth.organizationId, { ...(body.data.agentId ? { agentId: body.data.agentId } : {}), chainFamily: "evm", address, kmsKeyId: body.data.kmsKeyId }, auth.principalId);
+    return reply.code(201).send({ data: created });
+  });
+
+  // Executor rotation for Safe and Squads treasuries
+
+  app.get<{ Params: { id: string } }>("/v1/treasuries/:id/executor-rotations", async (request, reply) => {
+    const auth = human(request, reply); if (!auth) return;
+    const id = uuid.safeParse(request.params.id);
+    if (!id.success) return invalid(reply, "Invalid treasury ID");
+    return { data: await rotations.list(auth.organizationId, id.data) };
+  });
+
+  app.post<{ Params: { id: string } }>("/v1/treasuries/:id/executor-rotations", async (request, reply) => {
+    const auth = human(request, reply, ["owner"]); if (!auth) return;
+    const id = uuid.safeParse(request.params.id);
+    const body = z.object({ signerId: uuid }).safeParse(request.body);
+    if (!id.success || !body.success) return invalid(reply, "Invalid treasury or signer ID");
+    try {
+      return reply.code(201).send({ data: await rotations.start(auth.organizationId, id.data, body.data.signerId, auth.principalId) });
+    } catch (error) {
+      if (error instanceof OperationsError) return reply.code(error.code.endsWith("not_found") ? 404 : 409).send({ error: error.code, message: error.message });
+      throw error;
+    }
+  });
+
+  /** For Squads rotations: the approve or reject transaction for the member's wallet to sign and send. */
+  app.get<{ Params: { id: string; decision: string } }>("/v1/executor-rotations/:id/vote/:decision", async (request, reply) => {
+    const auth = human(request, reply, ["owner", "approver"]); if (!auth) return;
+    const id = uuid.safeParse(request.params.id);
+    const decision = z.enum(["approved", "rejected"]).safeParse(request.params.decision);
+    if (!id.success || !decision.success) return invalid(reply, "Invalid rotation or decision");
+    const rotation = await rotations.get(auth.organizationId, id.data);
+    if (!rotation?.externalRef || rotation.status !== "approval_required") return reply.code(409).send({ error: "rotation_not_awaiting_votes" });
+    if (!squadsAdapter || !solanaAdapter) return reply.code(503).send({ error: "network_not_configured" });
+    const wallet = (await store.listMembers(auth.organizationId)).find((member) => member.id === auth.principalId)?.wallets.find((candidate) => candidate.chainFamily === "svm");
+    if (!wallet) return reply.code(403).send({ error: "no_solana_wallet_bound" });
+    const instruction = squadsAdapter.voteInstruction(String(rotation.externalRef.multisigPda), BigInt(String(rotation.externalRef.transactionIndex)), wallet.address, decision.data);
+    const { blockhash } = await solanaAdapter.rpc.getLatestBlockhash("finalized");
+    const message = new TransactionMessage({ payerKey: new PublicKey(wallet.address), recentBlockhash: blockhash, instructions: [instruction] }).compileToV0Message();
+    return { data: { transactionBase64: Buffer.from(new VersionedTransaction(message).serialize()).toString("base64"), member: wallet.address, rotation } };
   });
 
   app.patch<{ Params: { id: string } }>("/v1/signers/:id/status", async (request, reply) => {

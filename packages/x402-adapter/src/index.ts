@@ -5,7 +5,7 @@ import type { PaymentPayload, PaymentRequired, PaymentRequirements, SettleRespon
 import { ExactEvmScheme as ExactEvmClientScheme } from "@x402/evm/exact/client";
 import { ExactSvmScheme as ExactSvmClientScheme } from "@x402/svm/exact/client";
 import { createKeyPairSignerFromBytes } from "@solana/kit";
-import { createPublicClient, http, parseAbiItem, type Address, type Hex } from "viem";
+import { createPublicClient, http, parseAbiItem, type Address, type Hex, type LocalAccount } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { Connection, PublicKey } from "@solana/web3.js";
 import { getAssociatedTokenAddressSync } from "@solana/spl-token";
@@ -116,11 +116,11 @@ export class X402PaymentClient {
   }
 
   /** Signs the payment for the quoted option. Nothing is sent. */
-  async createPayload(quote: X402Quote, key: { evmPrivateKey?: Hex; solanaSecretKey?: Uint8Array }): Promise<PaymentPayload> {
+  async createPayload(quote: X402Quote, key: { evmPrivateKey?: Hex; evmAccount?: LocalAccount; solanaSecretKey?: Uint8Array }): Promise<PaymentPayload> {
     const client = new x402Client(() => quote.requirements).setSpendControls(false);
     if (quote.requirements.network.startsWith("eip155:")) {
-      if (!key.evmPrivateKey) throw new Error("EVM key required for an EVM x402 payment");
-      const account = privateKeyToAccount(key.evmPrivateKey);
+      if (!key.evmPrivateKey && !key.evmAccount) throw new Error("EVM key required for an EVM x402 payment");
+      const account = key.evmAccount ?? privateKeyToAccount(key.evmPrivateKey!);
       const options = this.networks.evm ? { rpcUrl: this.networks.evm.rpcUrl } : undefined;
       client.register(quote.requirements.network, new ExactEvmClientScheme({ address: account.address as Hex, signTypedData: async (message) => (await account.signTypedData(message as never)) as Hex }, options));
     } else {

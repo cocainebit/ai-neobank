@@ -9,7 +9,7 @@
     "start": "node dist/server.js",
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test:integration": "RUN_API_INTEGRATION=1 vitest run --no-file-parallelism src/app.test.ts src/governance.test.ts src/x402.test.ts src/operations.test.ts"
+    "test:integration": "RUN_API_INTEGRATION=1 vitest run --no-file-parallelism src/app.test.ts src/governance.test.ts src/x402.test.ts src/operations.test.ts src/keys.test.ts"
   },
   "dependencies": {
     "@ai-neobank/domain": "workspace:*",

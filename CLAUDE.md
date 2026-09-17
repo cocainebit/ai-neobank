@@ -11,7 +11,7 @@ Codex 2026-09-16/17, taken over by Claude 2026-09-17. Status report with evidenc
 
 | instance | writes | mid-way through |
 |---|---|---|
-| achi-b6 (Claude, takeover) | everything under this repo | **done:** wallet auth, agent keys, policy/freeze/quorum on the durable path, sign-before-broadcast recovery, real finality, fee ledger, ERC-20/SPL. Safe + Squads on the intent path (executor never votes), x402 v2 from direct treasuries, invoices/beneficiaries/recurring/statements with a chain indexer and reconciliation. **next:** KMS signing and key rotation, then the frontend on the real API |
+| achi-b6 (Claude, takeover) | everything under this repo | **done:** wallet auth, agent keys, policy/freeze/quorum on the durable path, sign-before-broadcast recovery, real finality, fee ledger, ERC-20/SPL. Safe + Squads on the intent path (executor never votes), x402 v2 from direct treasuries, invoices/beneficiaries/recurring/statements with a chain indexer and reconciliation, KMS custody and key/executor rotation. **next:** frontend on the real API, then devnet runs and CI |
 
 ## Ports (this repo's block is 8720-8729)
 

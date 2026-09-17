@@ -63,9 +63,22 @@ real simulation, and human approval decide what gets signed.
   where they were paid, including Solana rent for recipient token accounts.
   Statements per treasury and asset come from the ledger, in JSON or CSV.
 
+- Key custody. Software signers are sealed under per-signer data keys wrapped
+  by a versioned key-encryption key: a local keyring in development, AWS KMS in
+  production (the API refuses locally wrapped software signers in production).
+  EVM signers can instead live entirely in KMS (ECC_SECG_P256K1): transactions,
+  Safe typed data, and messages are signed by KMS and the key never enters the
+  process. `pnpm --filter @ai-neobank/worker rotate-keys` re-wraps every data
+  key under the active key and upgrades legacy envelopes. A governed treasury's
+  executor can be rotated: Safe swaps immediately; Squads goes through an
+  on-chain config proposal the members approve.
+
 ## Not yet
 
-A frontend on the real API, HSM/KMS signing, devnet runs, CI. x402 from Safe or Squads treasuries is not
+A frontend on the real API, devnet runs, CI. KMS signing covers EVM keys;
+Solana signers use KMS-wrapped envelopes. The KMS integration is verified
+against the AWS SDK's own command objects and an in-process KMS stand-in,
+not yet against a live AWS account. x402 from Safe or Squads treasuries is not
 supported yet. The web app in `apps/web` is still the earlier fixture prototype.
 
 ## Run it locally

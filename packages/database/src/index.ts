@@ -3,7 +3,7 @@ import postgres, { type Sql, type TransactionSql } from "postgres";
 type Db = Sql | TransactionSql;
 import type { PaymentIntent, PolicyDefinition, PolicyDefinitionInput, PrincipalRole } from "@ai-neobank/domain";
 import { nativeAssetIds, policyDefinitionSchema } from "@ai-neobank/domain";
-export { createPostgresJobQueue, PostgresJobQueue, ExecutionRejected, Deferred, type JobRecord, type ExecutionContext, type ConfirmationContext, type SimulationEvidence, type Simulator, type AssetShape, type PublishContext, type Publisher, type ProposalObservation, type Observer } from "./jobs.js";
+export { createPostgresJobQueue, PostgresJobQueue, ExecutionRejected, Deferred, type SignerKeyMaterial, type JobRecord, type ExecutionContext, type ConfirmationContext, type SimulationEvidence, type Simulator, type AssetShape, type PublishContext, type Publisher, type ProposalObservation, type Observer } from "./jobs.js";
 
 export interface OrganizationRecord {
   id: string;
@@ -128,6 +128,9 @@ export interface StoredSignerSecret extends SignerRecord {
   encryptionNonce: string | null;
   authTag: string | null;
   keyVersion: number | null;
+  dataKey: string | null;
+  dataKeyVersion: string | null;
+  kmsKeyId: string | null;
 }
 
 export interface PolicyVersionRecord {
@@ -562,17 +565,57 @@ export class PostgresControlPlaneStore {
 
   // Signers
 
-  async createSigner(organizationId: string, input: { agentId?: string; chainFamily: SignerRecord["chainFamily"]; address: string; encryptedSecret: string; encryptionNonce: string; authTag: string; keyVersion: number }, actorPrincipalId?: string): Promise<SignerRecord> {
+  /**
+   * Stores a software signer. Pass `dataKey` and `dataKeyVersion` for a format 2
+   * envelope; `keyVersion` alone marks a legacy envelope sealed directly under
+   * a master key.
+   */
+  async createSigner(organizationId: string, input: { agentId?: string; chainFamily: SignerRecord["chainFamily"]; address: string; encryptedSecret: string; encryptionNonce: string; authTag: string; keyVersion?: number; dataKey?: string; dataKeyVersion?: string }, actorPrincipalId?: string): Promise<SignerRecord> {
     return this.sql.begin(async (tx) => {
       const rows = await tx.unsafe<SignerRecord[]>(
-        `insert into signers (organization_id, agent_id, chain_family, address, custody, encrypted_secret, encryption_nonce, auth_tag, key_version)
-         values ($1, $2, $3, $4, 'encrypted_software', $5, $6, $7, $8) returning ${signerColumns}`,
-        [organizationId, input.agentId ?? null, input.chainFamily, input.address, input.encryptedSecret, input.encryptionNonce, input.authTag, input.keyVersion]
+        `insert into signers (organization_id, agent_id, chain_family, address, custody, encrypted_secret, encryption_nonce, auth_tag, key_version, data_key, data_key_version)
+         values ($1, $2, $3, $4, 'encrypted_software', $5, $6, $7, $8, $9, $10) returning ${signerColumns}`,
+        [organizationId, input.agentId ?? null, input.chainFamily, input.address, input.encryptedSecret, input.encryptionNonce, input.authTag, input.keyVersion ?? (input.dataKey ? null : 1), input.dataKey ?? null, input.dataKeyVersion ?? null]
       );
       if (!rows[0]) throw new Error("Signer insert returned no row");
-      await this.audit(tx, organizationId, actorPrincipalId ?? null, "signer.created", "signer", rows[0].id, { chainFamily: input.chainFamily, address: input.address, keyVersion: input.keyVersion });
+      await this.audit(tx, organizationId, actorPrincipalId ?? null, "signer.created", "signer", rows[0].id, { chainFamily: input.chainFamily, address: input.address, custody: "encrypted_software", dataKeyVersion: input.dataKeyVersion ?? null });
       return rows[0];
     });
+  }
+
+  /** A signer whose private key lives in a KMS; only the key id and derived address are stored. */
+  async createKmsSigner(organizationId: string, input: { agentId?: string; chainFamily: SignerRecord["chainFamily"]; address: string; kmsKeyId: string }, actorPrincipalId?: string): Promise<SignerRecord> {
+    return this.sql.begin(async (tx) => {
+      const rows = await tx.unsafe<SignerRecord[]>(
+        `insert into signers (organization_id, agent_id, chain_family, address, custody, kms_key_id) values ($1, $2, $3, $4, 'kms', $5) returning ${signerColumns}`,
+        [organizationId, input.agentId ?? null, input.chainFamily, input.address, input.kmsKeyId]
+      );
+      if (!rows[0]) throw new Error("Signer insert returned no row");
+      await this.audit(tx, organizationId, actorPrincipalId ?? null, "signer.created", "signer", rows[0].id, { chainFamily: input.chainFamily, address: input.address, custody: "kms", kmsKeyId: input.kmsKeyId });
+      return rows[0];
+    });
+  }
+
+  /** Software signers not yet under the given key-encryption version, in id order after `afterId`. For rotation. */
+  listSignersToRewrap(activeVersion: string, options: { afterId?: string; limit?: number; organizationId?: string } = {}): Promise<StoredSignerSecret[]> {
+    return this.sql.unsafe<StoredSignerSecret[]>(
+      `select ${signerColumns}, encrypted_secret as "encryptedSecret", encryption_nonce as "encryptionNonce", auth_tag as "authTag", key_version as "keyVersion",
+         data_key as "dataKey", data_key_version as "dataKeyVersion", kms_key_id as "kmsKeyId"
+       from signers where custody = 'encrypted_software' and data_key_version is distinct from $1
+         and ($2::uuid is null or id > $2) and ($4::uuid is null or organization_id = $4)
+       order by id limit $3`,
+      [activeVersion, options.afterId ?? null, options.limit ?? 100, options.organizationId ?? null]
+    );
+  }
+
+  /** Replaces an envelope only if it is still the one that was read, so concurrent rotations cannot clobber each other. */
+  async replaceSignerEnvelope(signerId: string, previous: { dataKey: string | null; encryptedSecret: string | null }, sealed: { ciphertext: string; nonce: string; authTag: string; dataKey: string; dataKeyVersion: string }): Promise<boolean> {
+    const updated = await this.sql`
+      update signers set encrypted_secret = ${sealed.ciphertext}, encryption_nonce = ${sealed.nonce}, auth_tag = ${sealed.authTag},
+        data_key = ${sealed.dataKey}, data_key_version = ${sealed.dataKeyVersion}, key_version = null, rotated_at = now()
+      where id = ${signerId} and data_key is not distinct from ${previous.dataKey} and encrypted_secret is not distinct from ${previous.encryptedSecret}
+    `;
+    return updated.count > 0;
   }
 
   listSigners(organizationId: string): Promise<SignerRecord[]> {
@@ -581,7 +624,8 @@ export class PostgresControlPlaneStore {
 
   async getSignerSecret(organizationId: string, signerId: string): Promise<StoredSignerSecret | null> {
     const rows = await this.sql.unsafe<StoredSignerSecret[]>(
-      `select ${signerColumns}, encrypted_secret as "encryptedSecret", encryption_nonce as "encryptionNonce", auth_tag as "authTag", key_version as "keyVersion" from signers where organization_id = $1 and id = $2`,
+      `select ${signerColumns}, encrypted_secret as "encryptedSecret", encryption_nonce as "encryptionNonce", auth_tag as "authTag", key_version as "keyVersion",
+         data_key as "dataKey", data_key_version as "dataKeyVersion", kms_key_id as "kmsKeyId" from signers where organization_id = $1 and id = $2`,
       [organizationId, signerId]
     );
     return rows[0] ?? null;
@@ -892,3 +936,5 @@ export function createPostgresStore(databaseUrl: string): PostgresControlPlaneSt
 
 export { OperationsStore, OperationsError, type BeneficiaryRecord, type ScheduleRecord, type InvoiceRecord, type InvoiceLineItem, type InflowRecord, type ReconciliationRecord, type StatementRecord, type StatementLine } from "./operations.js";
 export { postLedger, ledgerNet, type LedgerLine, type LedgerAccountCode } from "./ledger.js";
+
+export { RotationStore, type ExecutorRotationRecord, type RotationContext } from "./rotations.js";

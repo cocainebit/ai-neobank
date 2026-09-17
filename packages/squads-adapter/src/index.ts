@@ -191,6 +191,35 @@ export class SquadsGovernanceAdapter {
     };
   }
 
+  /**
+   * A config transaction and proposal that replaces one member with another,
+   * published by an existing member with Initiate permission.
+   */
+  prepareMemberSwap(multisigPda: string, creator: PublicKey, transactionIndex: bigint, add: SquadsMemberSpec, remove: string, memo: string): { instructions: TransactionInstruction[]; ref: SquadsRef } {
+    const pda = new PublicKey(multisigPda);
+    const ref = this.refFor(pda, transactionIndex);
+    const actions: multisig.types.ConfigAction[] = [
+      { __kind: "AddMember", newMember: { key: new PublicKey(add.key), permissions: permissionsFor(add.role) } },
+      { __kind: "RemoveMember", oldMember: new PublicKey(remove) }
+    ];
+    const create = multisig.instructions.configTransactionCreate({ multisigPda: pda, transactionIndex, creator, actions, memo, programId: this.programId });
+    const propose = multisig.instructions.proposalCreate({ multisigPda: pda, creator, transactionIndex, programId: this.programId });
+    return { instructions: [create, propose], ref };
+  }
+
+  /** Whether the config transaction at this index exists and was created by `creator`. */
+  async configPublishedBy(multisigPda: string, transactionIndex: bigint, creator: string): Promise<boolean> {
+    const ref = this.refFor(new PublicKey(multisigPda), transactionIndex);
+    const info = await this.connection.getAccountInfo(new PublicKey(ref.transactionPda), "confirmed");
+    if (!info) return false;
+    const [account] = multisig.accounts.ConfigTransaction.fromAccountInfo(info);
+    return account.creator.toBase58() === creator;
+  }
+
+  prepareConfigExecute(multisigPda: string, transactionIndex: bigint, member: PublicKey): TransactionInstruction {
+    return multisig.instructions.configTransactionExecute({ multisigPda: new PublicKey(multisigPda), transactionIndex, member, rentPayer: member, programId: this.programId });
+  }
+
   /** Unsigned vote instruction for a member's wallet. */
   voteInstruction(multisigPda: string, transactionIndex: bigint, member: string, decision: "approved" | "rejected"): TransactionInstruction {
     const args = { multisigPda: new PublicKey(multisigPda), transactionIndex, member: new PublicKey(member), programId: this.programId };

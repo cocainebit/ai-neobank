@@ -9,6 +9,7 @@ export default {
     alias: [
       { find: /^@ai-neobank\/worker$/, replacement: `${root}apps/worker/src/worker.ts` },
       { find: /^@ai-neobank\/x402-adapter\/testing$/, replacement: `${root}packages/x402-adapter/src/testing.ts` },
+      { find: /^@ai-neobank\/signer\/testing$/, replacement: `${root}packages/signer/src/testing.ts` },
       { find: /^@ai-neobank\/([a-z0-9-]+)$/, replacement: `${root}packages/$1/src/index.ts` }
     ]
   }

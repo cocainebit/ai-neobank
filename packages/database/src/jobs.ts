@@ -31,6 +31,27 @@ export interface AssetShape {
   decimals: number;
 }
 
+/** How a signer's key is held: a sealed secret the worker opens, or a KMS key it asks to sign. */
+export interface SignerKeyMaterial {
+  custody: "encrypted_software" | "kms";
+  encryptedSecret: string | null;
+  encryptionNonce: string | null;
+  authTag: string | null;
+  keyVersion: number | null;
+  dataKey: string | null;
+  dataKeyVersion: string | null;
+  kmsKeyId: string | null;
+}
+
+const signerKeyColumns = (alias: string) => `${alias}.custody, ${alias}.encrypted_secret as "encryptedSecret", ${alias}.encryption_nonce as "encryptionNonce", ${alias}.auth_tag as "authTag",
+  ${alias}.key_version as "keyVersion", ${alias}.data_key as "dataKey", ${alias}.data_key_version as "dataKeyVersion", ${alias}.kms_key_id as "kmsKeyId"`;
+
+function keyMaterial(row: Omit<Partial<SignerKeyMaterial>, "custody"> & { custody?: string | null }): SignerKeyMaterial | null {
+  if (row.custody === "kms") return row.kmsKeyId ? { custody: "kms", encryptedSecret: null, encryptionNonce: null, authTag: null, keyVersion: null, dataKey: null, dataKeyVersion: null, kmsKeyId: row.kmsKeyId } : null;
+  if (row.custody !== "encrypted_software" || !row.encryptedSecret || !row.encryptionNonce || !row.authTag) return null;
+  return { custody: "encrypted_software", encryptedSecret: row.encryptedSecret, encryptionNonce: row.encryptionNonce, authTag: row.authTag, keyVersion: row.keyVersion ?? null, dataKey: row.dataKey ?? null, dataKeyVersion: row.dataKeyVersion ?? null, kmsKeyId: null };
+}
+
 export interface ExecutionContext {
   intentId: string;
   organizationId: string;
@@ -48,10 +69,7 @@ export interface ExecutionContext {
   /** The key that signs: the treasury itself (direct) or the organisation's executor (Safe, Squads). */
   signerId: string;
   signerAddress: string;
-  encryptedSecret: string;
-  encryptionNonce: string;
-  authTag: string;
-  keyVersion: number;
+  key: SignerKeyMaterial;
   approvalCompiledHash: string;
   externalRef: Record<string, unknown> | null;
   treasuryConfiguration: Record<string, unknown>;
@@ -79,10 +97,7 @@ export interface PublishContext {
   treasuryConfiguration: Record<string, unknown>;
   executorSignerId: string;
   executorAddress: string;
-  encryptedSecret: string;
-  encryptionNonce: string;
-  authTag: string;
-  keyVersion: number;
+  key: SignerKeyMaterial;
   /** What a previous, possibly crashed, attempt recorded before broadcasting. */
   publication: Record<string, unknown> | null;
 }
@@ -480,8 +495,8 @@ export class PostgresJobQueue {
 
   /** Everything the worker needs to publish a governed intent's proposal. */
   async getPublishContext(intentId: string): Promise<PublishContext> {
-    const rows = await this.sql.unsafe<(IntentRow & { signerAddress: string | null; encryptedSecret: string | null; encryptionNonce: string | null; authTag: string | null; keyVersion: number | null; signerStatus: string | null })[]>(`
-      select base.*, s.address as "signerAddress", s.encrypted_secret as "encryptedSecret", s.encryption_nonce as "encryptionNonce", s.auth_tag as "authTag", s.key_version as "keyVersion", s.status as "signerStatus"
+    const rows = await this.sql.unsafe<(IntentRow & Omit<SignerKeyMaterial, "custody"> & { custody: string | null; signerAddress: string | null; signerStatus: string | null })[]>(`
+      select base.*, s.address as "signerAddress", s.status as "signerStatus", ${signerKeyColumns("s")}
       from (${intentJoin} where i.id = $1) base
       left join signers s on s.id = base."executorSignerId"::uuid and s.organization_id = base."organizationId"::uuid
     `, [intentId]);
@@ -491,7 +506,8 @@ export class PostgresJobQueue {
     if (row.governance === "direct") throw new ExecutionRejected("Direct treasuries do not publish proposals");
     const gate = this.gate(row);
     if (gate) throw new ExecutionRejected(gate);
-    if (!row.executorSignerId || !row.signerAddress || !row.encryptedSecret || !row.encryptionNonce || !row.authTag || row.keyVersion === null) throw new ExecutionRejected("Treasury has no executor signer");
+    const publishKey = keyMaterial(row);
+    if (!row.executorSignerId || !row.signerAddress || !publishKey) throw new ExecutionRejected("Treasury has no executor signer");
     if (row.signerStatus !== "active") throw new ExecutionRejected(`Executor signer is ${row.signerStatus}`);
     if (new Date(row.expiresAt) <= new Date()) throw new ExecutionRejected("Intent expired before publication");
     const minApprovals = Number((row.policyDecision as { minApprovals?: number } | null)?.minApprovals ?? 1);
@@ -499,7 +515,7 @@ export class PostgresJobQueue {
       intentId, organizationId: row.organizationId, treasuryId: row.treasuryId, network: row.network, chainFamily: row.chainFamily, governance: row.governance,
       from: row.from, to: row.destination, asset: { id: row.assetId, kind: row.assetKind!, address: row.assetAddress, decimals: row.assetDecimals! }, amountBaseUnits: row.amountBaseUnits,
       expiresAt: row.expiresAt, minApprovals, treasuryConfiguration: row.observedConfiguration ?? {},
-      executorSignerId: row.executorSignerId, executorAddress: row.signerAddress, encryptedSecret: row.encryptedSecret, encryptionNonce: row.encryptionNonce, authTag: row.authTag, keyVersion: row.keyVersion,
+      executorSignerId: row.executorSignerId, executorAddress: row.signerAddress, key: publishKey,
       publication: row.publication
     };
   }
@@ -616,17 +632,17 @@ export class PostgresJobQueue {
    */
   async getExecutionContext(intentId: string): Promise<ExecutionContext> {
     const explicit = await this.sql.unsafe<(IntentRow & {
-      signerId: string | null; signerAddress: string | null; signerStatus: string | null; encryptedSecret: string | null; encryptionNonce: string | null; authTag: string | null; keyVersion: number | null;
+      signerId: string | null; signerAddress: string | null; signerStatus: string | null; signerCustody: string | null; encryptedSecret: string | null; encryptionNonce: string | null; authTag: string | null; keyVersion: number | null; dataKey: string | null; dataKeyVersion: string | null; kmsKeyId: string | null;
       approvalStatus: string | null; approvalCompiledHash: string | null; externalRef: Record<string, unknown> | null;
       executionId: string | null; executionStatus: string | null; transactionHash: string | null; signedPayload: string | null; nonce: string | null; validUntil: string | null;
     })[]>(`
-      select base.*, sg."signerId", sg."signerAddress", sg."signerStatus", sg."encryptedSecret", sg."encryptionNonce", sg."authTag", sg."keyVersion",
+      select base.*, sg."signerId", sg."signerAddress", sg."signerStatus", sg.custody as "signerCustody", sg."encryptedSecret", sg."encryptionNonce", sg."authTag", sg."keyVersion", sg."dataKey", sg."dataKeyVersion", sg."kmsKeyId",
         ar.status as "approvalStatus", ar.compiled_hash as "approvalCompiledHash", ar.external_ref as "externalRef",
         e.id::text as "executionId", e.status as "executionStatus", e.transaction_hash as "transactionHash", e.signed_payload as "signedPayload", e.nonce, e.valid_until as "validUntil"
       from (${intentJoin} where i.id = $1) base
       left join lateral (
-        select s.id::text as "signerId", s.address as "signerAddress", s.status as "signerStatus", s.encrypted_secret as "encryptedSecret", s.encryption_nonce as "encryptionNonce", s.auth_tag as "authTag", s.key_version as "keyVersion"
-        from signers s where s.organization_id = base."organizationId"::uuid and s.custody = 'encrypted_software' and s.chain_family = base."chainFamily"
+        select s.id::text as "signerId", s.address as "signerAddress", s.status as "signerStatus", ${signerKeyColumns("s")}
+        from signers s where s.organization_id = base."organizationId"::uuid and s.custody in ('encrypted_software', 'kms') and s.chain_family = base."chainFamily"
           and ((base.governance = 'direct' and lower(s.address) = lower(base."from")) or (base.governance <> 'direct' and s.id = base."executorSignerId"::uuid))
         order by s.created_at desc limit 1
       ) sg on true
@@ -640,7 +656,8 @@ export class PostgresJobQueue {
     if (row.status === "executing" && !row.executionId) throw new ExecutionRejected("Intent is executing without an execution record");
     const gate = this.gate(row);
     if (gate) throw new ExecutionRejected(gate);
-    if (!row.signerId || !row.signerAddress || !row.encryptedSecret || !row.encryptionNonce || !row.authTag || row.keyVersion === null) throw new ExecutionRejected(row.governance === "direct" ? "No encrypted signer matches the treasury address" : "Treasury has no executor signer");
+    const executionKey = keyMaterial({ ...row, custody: row.signerCustody });
+    if (!row.signerId || !row.signerAddress || !executionKey) throw new ExecutionRejected(row.governance === "direct" ? "No signer Relay holds matches the treasury address" : "Treasury has no executor signer");
     if (row.signerStatus !== "active") throw new ExecutionRejected(`Signer is ${row.signerStatus}`);
     if (row.status === "approved" && new Date(row.expiresAt) <= new Date()) throw new ExecutionRejected("Intent expired before execution");
     if (row.status === "approved") {
@@ -659,7 +676,7 @@ export class PostgresJobQueue {
       intentId, organizationId: row.organizationId, treasuryId: row.treasuryId, network: row.network, chainFamily: row.chainFamily, governance: row.governance,
       from: row.from, to: row.destination, assetId: row.assetId, asset: { id: row.assetId, kind: row.assetKind!, address: row.assetAddress, decimals: row.assetDecimals! },
       amountBaseUnits: row.amountBaseUnits, intentStatus: row.status, intentVersion: row.version,
-      signerId: row.signerId, signerAddress: row.signerAddress, encryptedSecret: row.encryptedSecret, encryptionNonce: row.encryptionNonce, authTag: row.authTag, keyVersion: row.keyVersion,
+      signerId: row.signerId, signerAddress: row.signerAddress, key: executionKey,
       approvalCompiledHash: row.approvalCompiledHash, externalRef: row.externalRef, treasuryConfiguration: row.observedConfiguration ?? {}, ownerSignatures,
       kind: row.kind, x402: (row.policyDecision as { x402?: Record<string, unknown> } | null)?.x402 ?? null,
       execution: row.executionId ? { id: row.executionId, status: row.executionStatus!, transactionHash: row.transactionHash, signedPayload: row.signedPayload, nonce: row.nonce, validUntil: row.validUntil } : null

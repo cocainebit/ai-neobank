@@ -82,9 +82,19 @@ real simulation, and human approval decide what gets signed.
   (`NEXT_PUBLIC_DEV_WALLET=1`) sign on local chains, so the whole product can be
   driven end to end without a browser extension.
 
+- Failure-recovery drills and a first devnet run. `docs/FAILURE-RECOVERY.md` lists
+  what is drilled: a replacement worker finishing a payment the first broadcast
+  and died on, a lapsed lease picked up exactly once, an RPC outage leaving a
+  broadcast payment alone rather than failing it, and an unapproved intent
+  expiring unsigned. A 0.01 SOL payment has settled on Solana devnet through the
+  whole pipeline at `finalized` commitment.
+
 ## Not yet
 
-Devnet runs and CI. KMS signing covers EVM keys;
+Base Sepolia (the preflight is green but its faucets are gated, so the transfer
+test skips until a funded key is configured), Squads and x402 on devnet, and CI
+that has actually run: `.github/workflows/ci.yml` exists but this repository has
+no remote yet. KMS signing covers EVM keys;
 Solana signers use KMS-wrapped envelopes. The KMS integration is verified
 against the AWS SDK's own command objects and an in-process KMS stand-in,
 not yet against a live AWS account. x402 from Safe or Squads treasuries is not

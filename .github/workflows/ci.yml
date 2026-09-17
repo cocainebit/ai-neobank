@@ -1,0 +1,82 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    name: Types, unit tests, build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.30.3
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm test
+      - run: pnpm build
+
+  integration:
+    name: Integration against local chains
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: relay
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports: ["8723:5432"]
+        options: >-
+          --health-cmd "pg_isready -U relay" --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      DATABASE_URL: postgres://relay@127.0.0.1:8723/relay
+      EVM_RPC_URL: http://127.0.0.1:8722
+      SOLANA_RPC_URL: http://127.0.0.1:8724
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.30.3
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: foundry-rs/foundry-toolchain@v1
+      - name: Install the Solana toolchain
+        run: |
+          sh -c "$(curl -sSfL https://release.anza.xyz/stable/install)"
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
+      - run: pnpm install --frozen-lockfile
+      - name: Create the database
+        run: psql "postgres://relay@127.0.0.1:8723/postgres" -c "create database relay"
+      - name: Start the local chains
+        run: |
+          anvil --port 8722 --chain-id 31337 --silent &
+          solana-test-validator --ledger /tmp/ledger --rpc-port 8724 --faucet-port 8726 --gossip-port 8727 \
+            --dynamic-port-range 8730-8755 --bind-address 127.0.0.1 --url https://api.devnet.solana.com \
+            --clone-upgradeable-program SQDS4ep65T869zMMBKyuUq6aD6EgTu8psMjkvj52pCf \
+            --maybe-clone BSTq9w3kZwNwpBXJEvTZz2G9ZTNyKBvoSeXMvwb4cNZr \
+            --maybe-clone HM5y4mz3Bt9JY9mr1hkyhnvqxSH4H2u2451j7Hc2dtvK \
+            --limit-ledger-size 20000 --reset --quiet &
+          for _ in $(seq 1 60); do
+            curl -sf -m 2 http://127.0.0.1:8724 -X POST -H 'content-type: application/json' \
+              -d '{"jsonrpc":"2.0","id":1,"method":"getHealth"}' | grep -q '"ok"' && break
+            sleep 2
+          done
+      - name: Deploy the local Safe and token fixtures
+        run: pnpm --filter @ai-neobank/worker exec tsx src/deploy-local-fixtures.ts
+        env:
+          LOCAL_FIXTURES_FILE: ${{ github.workspace }}/.local/local-fixtures.json
+      # One suite at a time: they share a job queue, and a worker for one chain would claim another suite's jobs.
+      - run: pnpm test:integration

@@ -8,7 +8,7 @@
     "dev": "tsx watch src/main.ts",
     "start": "node dist/main.js",
     "test": "vitest run --passWithNoTests",
-    "test:integration": "RUN_WORKER_INTEGRATION=1 vitest run --no-file-parallelism src/integration.test.ts src/governance.test.ts src/x402.test.ts src/receivables.test.ts src/keys.test.ts",
+    "test:integration": "RUN_WORKER_INTEGRATION=1 vitest run --no-file-parallelism src/integration.test.ts src/governance.test.ts src/x402.test.ts src/receivables.test.ts src/keys.test.ts src/recovery.test.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "rotate-keys": "tsx src/rotate-keys.ts"
   },

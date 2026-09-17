@@ -163,3 +163,12 @@ remain disabled until their proposal/approval/execution suites pass.
   reconciliation).
 - Boundary: executor keys are development software signers; nothing has run on
   a public test network.
+
+## Public test networks
+
+`pnpm --filter @ai-neobank/worker exec tsx src/devnet-preflight.ts` reads the
+public networks without sending anything and reports what is ready. The devnet
+lifecycle itself is `apps/worker/src/devnet.test.ts`, run with `RUN_DEVNET=1`.
+Base Sepolia needs a funded key in `DEVNET_EVM_KEY`, because its faucets are
+gated behind an account; Solana devnet funds a fresh treasury from the cluster
+faucet during the run.

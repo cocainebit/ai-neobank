@@ -369,11 +369,15 @@ export class DurableWorker {
     if (context.execution && !["simulated", "signed"].includes(context.execution.status)) {
       throw new Error(`Execution is already ${context.execution.status}`);
     }
-    const build = await this.buildExecution(context);
+    // Recovery: something signed exists, so the network decides what happened to
+    // it. Nothing is simulated or re-read from chain state here: the money may
+    // already have left, which would make a fresh simulation fail and condemn a
+    // payment that actually settled.
+    const recovering = context.execution?.status === "signed" && Boolean(context.execution.signedPayload) && Boolean(context.execution.transactionHash);
+    const build = await this.buildExecution(context, recovering ? "recover" : "sign");
     if ("failure" in build) { await this.queue.markFailed(intentId, build.failure); return; }
 
-    // Recovery: something signed exists, so the network decides what happened to it.
-    if (context.execution?.status === "signed" && context.execution.signedPayload && context.execution.transactionHash) {
+    if (recovering && context.execution?.signedPayload && context.execution.transactionHash) {
       const signed: SignedTransaction = { hash: context.execution.transactionHash, raw: context.execution.signedPayload, nonce: context.execution.nonce ?? "", validUntil: context.execution.validUntil ?? "" };
       const recovered = await build.recover(signed);
       if (recovered.outcome === "dead") { await this.queue.markFailed(intentId, `Signed transaction can never land: ${recovered.reason}`); return; }
@@ -404,9 +408,19 @@ export class DurableWorker {
   }
 
   /** Compiles, simulates, and prepares the signer for the intent's governance kind. */
-  private async buildExecution(context: ExecutionContext): Promise<{ failure: string } | ExecutionPlan> {
+  private async buildExecution(context: ExecutionContext, mode: "sign" | "recover" = "sign"): Promise<{ failure: string } | ExecutionPlan> {
     const amount = BigInt(context.amountBaseUnits);
-    if (context.kind === "x402") return this.buildX402(context);
+    if (context.kind === "x402") return this.buildX402(context, mode);
+    if (mode === "recover") {
+      // Only delivery matters now: resend the same bytes, or accept what the chain already has.
+      return {
+        feeBaseUnits: 0n,
+        compiledPayload: { kind: "recovery", network: context.network },
+        compiledHash: context.approvalCompiledHash,
+        sign: async () => { throw new Error("Recovery never signs; the signed transaction already exists"); },
+        ...this.chainDelivery(this.adapterFor(context.chainFamily, context.network))
+      };
+    }
     if (context.governance === "direct") {
       const compiledHash = directCompiledHash(context);
       if (compiledHash !== context.approvalCompiledHash) return { failure: "Compiled payload no longer matches the approved hash" };
@@ -478,7 +492,7 @@ export class DurableWorker {
    * comes back from the seller. A retry re-sends the same payload, which the
    * network can only honour once.
    */
-  private async buildX402(context: ExecutionContext): Promise<{ failure: string } | ExecutionPlan> {
+  private async buildX402(context: ExecutionContext, mode: "sign" | "recover" = "sign"): Promise<{ failure: string } | ExecutionPlan> {
     const stored = context.x402 as { url?: string; method?: string; x402Version?: number; requirements?: X402Quote["requirements"]; resource?: X402Quote["resource"]; paymentRequired?: X402Quote["paymentRequired"] } | null;
     if (!stored?.url || !stored.requirements || !stored.paymentRequired || !stored.resource) return { failure: "Intent has no x402 quote" };
     const quote: X402Quote = { url: stored.url, method: stored.method ?? "GET", x402Version: stored.x402Version ?? 2, requirements: stored.requirements, resource: stored.resource, paymentRequired: stored.paymentRequired };
@@ -486,8 +500,10 @@ export class DurableWorker {
     const client = await this.x402();
     const adapter = this.adapterFor(context.chainFamily, context.network);
     const price = BigInt(quote.requirements.amount);
-    const balance = await adapter.getBalance(context.from, resolvedAsset(context.asset));
-    if (balance < price) return { failure: `Insufficient token balance for the quoted price: ${balance} < ${price}` };
+    if (mode === "sign") {
+      const balance = await adapter.getBalance(context.from, resolvedAsset(context.asset));
+      if (balance < price) return { failure: `Insufficient token balance for the quoted price: ${balance} < ${price}` };
+    }
     const settlementOf = (transactionHash: string, observed: Record<string, unknown>): Settlement => ({ transactionHash, payTo: quote.requirements.payTo, amountBaseUnits: quote.requirements.amount, observed });
     const lookup = async (): Promise<Settlement | null> => {
       const found = context.chainFamily === "evm"

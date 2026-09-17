@@ -52,13 +52,17 @@ export const spendingPolicySchema = z.object({
   allowedDestinations: z.array(z.string()).default([]),
   allowedKinds: z.array(z.enum(intentKinds)).min(1).default(["transfer"]),
   humanApprovalRequired: z.boolean().default(true),
-  minApprovals: z.number().int().min(1).max(20).default(1)
+  minApprovals: z.number().int().min(1).max(20).default(1),
+  /** Transfers may only go to owner-approved beneficiaries. Does not apply to x402, whose destination is a URL. */
+  requireBeneficiary: z.boolean().default(false)
 });
 export type SpendingPolicy = z.infer<typeof spendingPolicySchema>;
 
 /** The editable part of a policy, as stored in policy_versions.definition. */
 export const policyDefinitionSchema = spendingPolicySchema.omit({ id: true, version: true });
 export type PolicyDefinition = z.infer<typeof policyDefinitionSchema>;
+/** A definition as callers write it: omitted fields take the schema defaults. */
+export type PolicyDefinitionInput = z.input<typeof policyDefinitionSchema>;
 
 export type PolicyDecision =
   | { outcome: "rejected"; reasons: string[] }

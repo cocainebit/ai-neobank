@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { createPostgresJobQueue, createPostgresStore, ExecutionRejected, type PostgresControlPlaneStore } from "./index.js";
-import type { PolicyDefinition } from "@ai-neobank/domain";
+import type { PolicyDefinitionInput } from "@ai-neobank/domain";
 
 const databaseUrl = process.env.DATABASE_URL;
 const testIf = process.env.RUN_DATABASE_INTEGRATION === "1" && databaseUrl ? it : it.skip;
@@ -8,7 +8,7 @@ const network = "eip155:31337";
 const nativeAsset = `${network}/slip44:60`;
 const address = () => `0x${crypto.randomUUID().replaceAll("-", "").padEnd(40, "0")}`;
 
-function policy(overrides: Partial<PolicyDefinition> = {}): PolicyDefinition {
+function policy(overrides: Partial<PolicyDefinitionInput> = {}): PolicyDefinitionInput {
   return { frozen: false, maxPerTransactionBaseUnits: "1000", maxDailyBaseUnits: "1500", autoApproveUpToBaseUnits: "0", allowedNetworks: [network], allowedAssets: [nativeAsset], allowedDestinations: [], allowedKinds: ["transfer"], humanApprovalRequired: true, minApprovals: 2, ...overrides };
 }
 

@@ -68,6 +68,20 @@ export interface TransactionReceipt {
   feeBaseUnits: bigint;
   /** Amount the destination observably received for the transfer, in the transferred asset's base units, when derivable. */
   destinationDeltaBaseUnits?: bigint;
+  /** Native base units that left `expected.from` in this transaction (fees, rent, and native value), when derivable. */
+  sourceNativeSpentBaseUnits?: bigint;
+}
+
+/** One observed receipt into a watched address. */
+export interface ObservedInflow {
+  transactionHash: string;
+  /** Distinguishes several receipts in one transaction (log index, or "native"). */
+  eventKey: string;
+  amountBaseUnits: bigint;
+  from: string | null;
+  blockCursor: string;
+  /** Solana: every account key in the transaction, for Solana Pay reference matching. */
+  accountKeys?: string[];
 }
 
 /** Outcome of asking the chain about a signed transaction that may never have been sent. */
@@ -86,7 +100,7 @@ export interface ChainAdapter {
   broadcast(signed: SignedTransaction): Promise<SubmittedTransaction>;
   /** Resolves whether a signed-but-possibly-unsent transaction landed, can still be resent, or can never land. */
   broadcastStatus(signed: SignedTransaction): Promise<BroadcastStatus>;
-  waitForTransaction(hash: string, expected?: { to: string; asset: ResolvedAsset; amountBaseUnits: bigint }): Promise<TransactionReceipt>;
+  waitForTransaction(hash: string, expected?: { to: string; asset: ResolvedAsset; amountBaseUnits: bigint; from?: string }): Promise<TransactionReceipt>;
 }
 
 export function assertPositiveTransfer(request: { from: string; to: string; amountBaseUnits: bigint; idempotencyKey: string }): void {

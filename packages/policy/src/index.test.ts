@@ -29,7 +29,8 @@ const policy: SpendingPolicy = {
   allowedDestinations: [],
   humanApprovalRequired: false,
   allowedKinds: ["transfer", "x402"],
-  minApprovals: 1
+  minApprovals: 1,
+  requireBeneficiary: false
 };
 
 describe("evaluatePaymentIntent", () => {
@@ -55,6 +56,14 @@ describe("evaluatePaymentIntent", () => {
       now: new Date("2026-09-16T00:00:00.000Z")
     });
     expect(decision).toEqual({ outcome: "rejected", reasons: ["Intent kind x402 is not allowed"] });
+  });
+
+  it("requires an approved beneficiary for transfers when the policy says so", () => {
+    const transfer = { ...intent, kind: "transfer" as const };
+    const strict = { ...policy, requireBeneficiary: true };
+    const now = new Date("2026-09-16T00:00:00.000Z");
+    expect(evaluatePaymentIntent(transfer, strict, { spentTodayBaseUnits: "0", now }).reasons).toContain("Destination is not an approved beneficiary");
+    expect(evaluatePaymentIntent(transfer, strict, { spentTodayBaseUnits: "0", now, destinationIsBeneficiary: true }).outcome).toBe("auto_authorized");
   });
 
   it("rejects a frozen policy even when limits permit payment", () => {

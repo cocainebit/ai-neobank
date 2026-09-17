@@ -1,6 +1,7 @@
 import { buildApp } from "./app.js";
 import { createPostgresJobQueue, createPostgresStore } from "@ai-neobank/database";
 import { parseMasterKey } from "@ai-neobank/signer";
+import { HTTPFacilitatorClient } from "@x402/core/server";
 
 const env = process.env;
 const databaseUrl = env.DATABASE_URL;
@@ -18,6 +19,7 @@ const app = buildApp({
   auth: { domain: env.AUTH_DOMAIN ?? "localhost", uri: env.AUTH_URI ?? `http://localhost:${port}` },
   ...(env.WEB_ORIGIN ? { webOrigin: env.WEB_ORIGIN } : {}),
   ...(signerMasterKey && env.ALLOW_SOFTWARE_SIGNERS === "true" && environment !== "production" ? { signerMasterKey, allowSoftwareSigners: true } : {}),
+  ...(env.X402_FACILITATOR_URL ? { x402Seller: { facilitator: new HTTPFacilitatorClient({ url: env.X402_FACILITATOR_URL }) } } : {}),
   chains: {
     ...(env.EVM_RPC_URL && evmChainId ? { evm: { rpcUrl: env.EVM_RPC_URL, chainId: evmChainId, network: `eip155:${evmChainId}` as const, confirmations: Number(env.EVM_CONFIRMATIONS ?? 1) } } : {}),
     ...(env.SOLANA_RPC_URL && env.SOLANA_NETWORK ? { solana: { rpcUrl: env.SOLANA_RPC_URL, network: env.SOLANA_NETWORK as `solana:${string}`, finality: (env.SOLANA_FINALITY as "confirmed" | "finalized" | undefined) ?? "finalized" } } : {})

@@ -1,7 +1,9 @@
 import Fastify, { type FastifyReply, type FastifyRequest } from "fastify";
 import cookie from "@fastify/cookie";
 import cors from "@fastify/cors";
-import { ApprovalError, type PostgresControlPlaneStore, type PostgresJobQueue, type SessionRecord } from "@ai-neobank/database";
+import { ApprovalError, OperationsStore, type PostgresControlPlaneStore, type PostgresJobQueue, type SessionRecord } from "@ai-neobank/database";
+import type { FacilitatorClient } from "@x402/core/server";
+import { registerOperationsRoutes } from "./operations-routes.js";
 import { paymentIntentSchema, policyDefinitionSchema, spendingPolicySchema, tokenAssetId, type PrincipalRole } from "@ai-neobank/domain";
 import { evaluatePaymentIntent } from "@ai-neobank/policy";
 import { encryptSecret, exportDevelopmentSecret, generateSigner } from "@ai-neobank/signer";
@@ -42,6 +44,8 @@ export interface AppOptions {
     solana?: { network: `solana:${string}`; rpcUrl: string; finality?: "confirmed" | "finalized"; x402Network?: string };
   };
   logger?: boolean;
+  /** Enables paying invoices over x402 at /v1/public/invoices/:token/x402 through this facilitator (CDP in production). */
+  x402Seller?: { facilitator: FacilitatorClient };
 }
 
 type HumanAuth = { kind: "human"; organizationId: string; principalId: string; role: PrincipalRole; sessionId: string; walletId: string | null; tokenHash: string; viaCookie: boolean };
@@ -104,10 +108,12 @@ const intentInputSchema = z.object({
   kind: z.enum(["transfer", "x402"]).default("transfer"),
   assetId: z.string().min(1),
   amountBaseUnits: z.string().regex(/^\d+$/),
-  destination: z.string().min(1),
+  destination: z.string().min(1).optional(),
+  /** Pay a saved beneficiary instead of a raw address. */
+  beneficiaryId: z.string().uuid().optional(),
   purpose: z.string().min(3).max(280),
   expiresAt: z.string().datetime().optional()
-});
+}).refine((value) => Boolean(value.destination) !== Boolean(value.beneficiaryId), "Provide exactly one of destination or beneficiaryId");
 const decisionSchema = z.object({
   expectedIntentVersion: z.number().int().positive(),
   compiledHash: z.string().regex(/^[a-f0-9]{64}$/),
@@ -125,6 +131,7 @@ function invalid(reply: FastifyReply, details: unknown) {
 export function buildApp(options: AppOptions) {
   const app = Fastify({ logger: options.logger ?? true });
   const { store, queue } = options;
+  const operations = new OperationsStore(store.sql);
   const sessionTtl = options.auth.sessionTtlSeconds ?? 12 * 60 * 60;
   const allowedOrigins = new Set([options.webOrigin, options.auth.uri].filter((value): value is string => Boolean(value)).map((value) => new URL(value).origin));
 
@@ -611,14 +618,22 @@ export function buildApp(options: AppOptions) {
     const treasury = await store.getTreasury(organizationId, parsed.data.treasuryAccountId);
     if (!treasury) return reply.code(404).send({ error: "treasury_not_found" });
     let destination: string;
-    if (parsed.data.kind === "x402") {
+    let beneficiaryId: string | undefined;
+    if (parsed.data.beneficiaryId) {
+      if (parsed.data.kind !== "transfer") return invalid(reply, "Beneficiaries receive transfers, not x402 payments");
+      const beneficiary = await operations.getBeneficiary(organizationId, parsed.data.beneficiaryId);
+      if (!beneficiary || beneficiary.network !== treasury.network) return reply.code(404).send({ error: "beneficiary_not_found_on_network" });
+      if (beneficiary.status !== "active") return reply.code(409).send({ error: "beneficiary_not_approved" });
+      destination = beneficiary.address;
+      beneficiaryId = beneficiary.id;
+    } else if (parsed.data.kind === "x402") {
       let url: URL;
-      try { url = new URL(parsed.data.destination); } catch { return invalid(reply, "x402 destination must be a URL"); }
+      try { url = new URL(parsed.data.destination ?? ""); } catch { return invalid(reply, "x402 destination must be a URL"); }
       const local = ["localhost", "127.0.0.1"].includes(url.hostname);
       if (url.protocol !== "https:" && !(url.protocol === "http:" && local && options.environment !== "production")) return invalid(reply, "x402 destination must be https");
       destination = url.toString();
     } else {
-      try { destination = canonicalAddress(treasury.chainFamily, parsed.data.destination); } catch { return invalid(reply, "Destination is not a valid address for the treasury's chain"); }
+      try { destination = canonicalAddress(treasury.chainFamily, parsed.data.destination ?? ""); } catch { return invalid(reply, "Destination is not a valid address for the treasury's chain"); }
     }
     const intent = paymentIntentSchema.safeParse({
       id: crypto.randomUUID(),
@@ -635,7 +650,7 @@ export function buildApp(options: AppOptions) {
       kind: parsed.data.kind
     });
     if (!intent.success) return invalid(reply, intent.error.flatten());
-    const result = await store.createIntent(intent.data);
+    const result = await store.createIntent(intent.data, beneficiaryId ? { beneficiaryId } : {});
     return reply.code(result.created ? 202 : 200).send({ data: result.record, idempotentReplay: !result.created });
   }
 
@@ -802,6 +817,8 @@ export function buildApp(options: AppOptions) {
       throw error;
     }
   });
+
+  registerOperationsRoutes(app, { options, store, operations, queue, human, adapters: { evm: evmAdapter, solana: solanaAdapter }, wireNetwork: async (family, network) => family === "evm" ? network : (options.chains?.solana?.x402Network ?? await solanaWireNetwork(network, options.chains?.solana?.rpcUrl ?? "")) });
 
   // Ledger, audit, operations
 

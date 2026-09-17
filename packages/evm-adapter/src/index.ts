@@ -2,6 +2,7 @@ import type {
   AdapterHealth,
   BroadcastStatus,
   ChainAdapter,
+  ObservedInflow,
   ResolvedAsset,
   SignedTransaction,
   SubmittedTransaction,
@@ -147,6 +148,57 @@ export class EvmAdapter implements ChainAdapter {
     }
   }
 
+  /** The EIP-712 name and version an EIP-3009 token signs under (USDC on Base: "USD Coin", "2"). */
+  async readEip712Domain(token: string): Promise<{ name: string; version: string }> {
+    const address = token as Address;
+    const name = await this.publicClient.readContract({ address, abi: [parseAbiItem("function name() view returns (string)")], functionName: "name" });
+    const version = await this.publicClient.readContract({ address, abi: [parseAbiItem("function version() view returns (string)")], functionName: "version" }).catch(() => "1");
+    return { name, version };
+  }
+
+  /** Highest block considered final under this adapter's confirmation rule. */
+  async safeHead(): Promise<bigint> {
+    const head = await this.publicClient.getBlockNumber();
+    const safe = head - BigInt(this.confirmations) + 1n;
+    return safe < 0n ? 0n : safe;
+  }
+
+  /** Balance of an asset at a block. */
+  async getBalanceAt(address: string, asset: ResolvedAsset, blockNumber: bigint): Promise<bigint> {
+    if (asset.kind === "native") return this.balanceAt(address, blockNumber);
+    if (asset.kind !== "erc20") throw new Error(`Asset kind ${asset.kind} is not an EVM asset`);
+    return this.publicClient.readContract({ address: asset.address as Address, abi: erc20Abi, functionName: "balanceOf", args: [address as Address], blockNumber });
+  }
+
+  /** ERC-20 transfers into `to` within an inclusive block range. */
+  async scanTokenInflows(token: string, to: string, fromBlock: bigint, toBlock: bigint): Promise<ObservedInflow[]> {
+    if (fromBlock > toBlock) return [];
+    const logs = await this.publicClient.getLogs({ address: token as Address, event: transferEvent, args: { to: to as Address }, fromBlock, toBlock });
+    return logs
+      .filter((log) => (log.args.value ?? 0n) > 0n && !log.removed)
+      .map((log) => ({ transactionHash: log.transactionHash, eventKey: `log:${log.logIndex}`, amountBaseUnits: log.args.value ?? 0n, from: log.args.from ?? null, blockCursor: String(log.blockNumber) }));
+  }
+
+  /**
+   * Native value sent directly to `to` by top-level transactions in the range.
+   * Value moved by contracts (internal transfers) is not visible here and shows
+   * up as a reconciliation difference instead.
+   */
+  async scanNativeInflows(to: string, fromBlock: bigint, toBlock: bigint): Promise<ObservedInflow[]> {
+    const found: ObservedInflow[] = [];
+    const target = to.toLowerCase();
+    for (let number = fromBlock; number <= toBlock; number += 1n) {
+      const block = await this.publicClient.getBlock({ blockNumber: number, includeTransactions: true });
+      for (const transaction of block.transactions) {
+        if (transaction.to?.toLowerCase() !== target || transaction.value === 0n) continue;
+        const receipt = await this.publicClient.getTransactionReceipt({ hash: transaction.hash });
+        if (receipt.status !== "success") continue;
+        found.push({ transactionHash: transaction.hash, eventKey: "native", amountBaseUnits: transaction.value, from: transaction.from, blockCursor: String(number) });
+      }
+    }
+    return found;
+  }
+
   /** Native balance at a specific block; used to prove internal transfers made by a contract such as a Safe. */
   balanceAt(address: string, blockNumber: bigint): Promise<bigint> {
     return this.publicClient.getBalance({ address: address as Address, blockNumber });
@@ -167,7 +219,7 @@ export class EvmAdapter implements ChainAdapter {
     return { state: "unseen_resendable" };
   }
 
-  async waitForTransaction(hash: string, expected?: { to: string; asset: ResolvedAsset; amountBaseUnits: bigint }): Promise<TransactionReceipt> {
+  async waitForTransaction(hash: string, expected?: { to: string; asset: ResolvedAsset; amountBaseUnits: bigint; from?: string }): Promise<TransactionReceipt> {
     const receipt = await this.publicClient.getTransactionReceipt({ hash: hash as Hex }).catch(() => null);
     if (!receipt) {
       const pendingTransaction = await this.publicClient.getTransaction({ hash: hash as Hex }).catch(() => null);

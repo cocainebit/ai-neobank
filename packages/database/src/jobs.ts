@@ -3,6 +3,7 @@ import postgres, { type JSONValue, type Sql, type TransactionSql } from "postgre
 type Db = Sql | TransactionSql;
 import { evaluatePaymentIntent } from "@ai-neobank/policy";
 import { policyDefinitionSchema, nativeAssetIds, type PaymentIntent, type PolicyDecision, type SpendingPolicy } from "@ai-neobank/domain";
+import { postLedger, type LedgerLine } from "./ledger.js";
 
 export interface JobRecord {
   id: string;
@@ -102,6 +103,10 @@ export interface ConfirmationContext {
   treasuryId: string;
   network: string;
   chainFamily: "evm" | "svm";
+  governance: "safe" | "squads" | "direct";
+  kind: "transfer" | "x402";
+  /** The treasury address the transfer left from. */
+  from: string;
   to: string;
   assetId: string;
   asset: AssetShape;
@@ -177,6 +182,40 @@ const intentJoin = `
   left join assets a on a.id = i.asset_id
 `;
 
+/**
+ * What an execution cost beyond the transfer itself, booked where it was paid.
+ * A direct treasury pays its own fees and, on Solana, any rent for accounts the
+ * transfer creates. A Safe or Squads vault pays rent it incurs, while the
+ * executor pays the network fee from the organisation's executor float. An
+ * x402 facilitator pays fees for the payer, so nothing is booked for them.
+ */
+function costLines(input: { treasuryId: string; governance: "safe" | "squads" | "direct"; kind: "transfer" | "x402"; chainFamily: "evm" | "svm"; nativeAsset: string; transfersNative: boolean; amountBaseUnits: bigint; feeBaseUnits: bigint; sourceNativeSpentBaseUnits?: bigint }): LedgerLine[] {
+  if (input.kind === "x402") return [];
+  const lines: LedgerLine[] = [];
+  const treasuryLines = (amount: bigint) => {
+    if (amount <= 0n) return;
+    lines.push(
+      { treasuryId: input.treasuryId, code: "fee_expense", assetId: input.nativeAsset, direction: "debit", amount: amount.toString() },
+      { treasuryId: input.treasuryId, code: "treasury_asset", assetId: input.nativeAsset, direction: "credit", amount: amount.toString() }
+    );
+  };
+  const executorLines = (amount: bigint) => {
+    if (amount <= 0n) return;
+    lines.push(
+      { treasuryId: null, code: "executor_fee_expense", assetId: input.nativeAsset, direction: "debit", amount: amount.toString() },
+      { treasuryId: null, code: "treasury_asset", assetId: input.nativeAsset, direction: "credit", amount: amount.toString() }
+    );
+  };
+  if (input.chainFamily === "svm" && input.sourceNativeSpentBaseUnits !== undefined) {
+    treasuryLines(input.sourceNativeSpentBaseUnits - (input.transfersNative ? input.amountBaseUnits : 0n));
+    if (input.governance !== "direct") executorLines(input.feeBaseUnits);
+    return lines;
+  }
+  if (input.governance === "direct") treasuryLines(input.feeBaseUnits);
+  else executorLines(input.feeBaseUnits);
+  return lines;
+}
+
 export class PostgresJobQueue {
   constructor(readonly sql: Sql) {}
 
@@ -225,6 +264,15 @@ export class PostgresJobQueue {
       `;
       return rows[0] ?? null;
     });
+  }
+
+  /** Enqueues a job directly; a dedupe key makes repeated calls for the same period a no-op. */
+  async enqueueJob(organizationId: string | null, type: string, payload: Record<string, unknown>, dedupeKey: string): Promise<boolean> {
+    const inserted = await this.sql`
+      insert into jobs (organization_id, type, payload, dedupe_key) values (${organizationId}, ${type}, ${this.sql.json(payload as JSONValue)}, ${dedupeKey})
+      on conflict (dedupe_key) where dedupe_key is not null do nothing
+    `;
+    return inserted.count > 0;
   }
 
   async heartbeat(jobId: string, leaseSeconds = 60): Promise<void> {
@@ -284,6 +332,16 @@ export class PostgresJobQueue {
     return { versionId: row.id, policy: { ...definition, id: row.policyId, version: row.version } };
   }
 
+  private async isBeneficiary(tx: Db, organizationId: string, network: string, chainFamily: "evm" | "svm", destination: string): Promise<boolean> {
+    const rows = await tx<{ id: string }[]>`
+      select id::text from beneficiaries
+      where organization_id = ${organizationId} and network = ${network} and status = 'active'
+        and (address = ${destination} or (${chainFamily} = 'evm' and lower(address) = lower(${destination})))
+      limit 1
+    `;
+    return rows.length > 0;
+  }
+
   /** Base units of the same asset the requester has committed in the trailing 24 hours, excluding this intent. */
   private async spentToday(tx: Db, organizationId: string, requesterId: string, assetId: string, excludeIntentId: string): Promise<string> {
     const rows = await tx<{ spent: string }[]>`
@@ -338,7 +396,7 @@ export class PostgresJobQueue {
     const policyResult = await this.loadPolicy(this.sql, row.organizationId, row.requesterId, row.treasuryId);
     const spent = await this.spentToday(this.sql, row.organizationId, row.requesterId, row.assetId, intentId);
     const decision: PolicyDecision = policyResult
-      ? evaluatePaymentIntent(this.intentOf(row), policyResult.policy, { spentTodayBaseUnits: spent, now: new Date() })
+      ? evaluatePaymentIntent(this.intentOf(row), policyResult.policy, { spentTodayBaseUnits: spent, now: new Date(), destinationIsBeneficiary: await this.isBeneficiary(this.sql, row.organizationId, row.network, row.chainFamily, row.destination) })
       : { outcome: "approval_required", reasons: ["No policy is bound to this agent or treasury; human approval is required"] };
     if (decision.outcome === "rejected") {
       await this.reject(intentId, row, decision, policyResult?.versionId ?? null);
@@ -590,7 +648,7 @@ export class PostgresJobQueue {
       const policyResult = await this.loadPolicy(this.sql, row.organizationId, row.requesterId, row.treasuryId);
       if (policyResult) {
         const spent = await this.spentToday(this.sql, row.organizationId, row.requesterId, row.assetId, intentId);
-        const decision = evaluatePaymentIntent(this.intentOf(row), policyResult.policy, { spentTodayBaseUnits: spent, now: new Date() });
+        const decision = evaluatePaymentIntent(this.intentOf(row), policyResult.policy, { spentTodayBaseUnits: spent, now: new Date(), destinationIsBeneficiary: await this.isBeneficiary(this.sql, row.organizationId, row.network, row.chainFamily, row.destination) });
         if (decision.outcome === "rejected") throw new ExecutionRejected(`Policy rejected at execution: ${decision.reasons.join("; ")}`);
       }
     }
@@ -656,7 +714,7 @@ export class PostgresJobQueue {
       if (!intent) throw new Error("Intent was not executing during submission");
       const amount = settlement?.amountBaseUnits ?? intent.amountBaseUnits;
       await this.event(tx, intent.organizationId, intentId, "intent.submitted", { transactionHash: execution.transactionHash, ...(settlement ? { payTo: settlement.payTo, amountBaseUnits: amount } : {}) });
-      await this.postLedger(tx, intent.organizationId, intentId, `${execution.network}:${execution.transactionHash}:submitted`, "Outbound transfer submitted", [
+      await postLedger(tx, intent.organizationId, intentId, `${execution.network}:${execution.transactionHash}:submitted`, "Outbound transfer submitted", [
         { treasuryId: intent.treasuryId, code: "pending_outbound", assetId: intent.assetId, direction: "debit", amount },
         { treasuryId: intent.treasuryId, code: "treasury_asset", assetId: intent.assetId, direction: "credit", amount }
       ]);
@@ -670,9 +728,10 @@ export class PostgresJobQueue {
   /** Terminal failure. Reverses the pending booking if the transfer had been submitted; books the fee if one was paid. */
   async markFailed(intentId: string, reason: string, fee?: { feeBaseUnits: bigint; network: string; transactionHash: string }): Promise<void> {
     await this.sql.begin(async (tx) => {
-      const rows = await tx<{ organizationId: string; treasuryId: string; assetId: string; amountBaseUnits: string; status: string; version: number; chainFamily: "evm" | "svm"; network: string }[]>`
-        select i.organization_id::text as "organizationId", i.treasury_account_id::text as "treasuryId", i.asset_id as "assetId", i.amount_base_units::text as "amountBaseUnits",
-          i.status, i.version, t.chain_family as "chainFamily", i.network
+      const rows = await tx<{ organizationId: string; treasuryId: string; assetId: string; amountBaseUnits: string; status: string; version: number; chainFamily: "evm" | "svm"; network: string; governance: "safe" | "squads" | "direct"; kind: "transfer" | "x402" }[]>`
+        select i.organization_id::text as "organizationId", i.treasury_account_id::text as "treasuryId", i.asset_id as "assetId",
+          coalesce((select e.compiled_payload->>'settledAmountBaseUnits' from executions e where e.intent_id = i.id), i.amount_base_units::text) as "amountBaseUnits",
+          i.status, i.version, t.chain_family as "chainFamily", i.network, t.governance, i.kind
         from intents i join treasury_accounts t on t.id = i.treasury_account_id where i.id = ${intentId} for update of i
       `;
       const intent = rows[0];
@@ -685,17 +744,14 @@ export class PostgresJobQueue {
       await this.event(tx, intent.organizationId, intentId, "intent.failed", { from: intent.status, reason });
       const execution = executions[0];
       if (intent.status === "submitted" && execution?.transactionHash) {
-        await this.postLedger(tx, intent.organizationId, intentId, `${execution.network}:${execution.transactionHash}:reversal`, `Submitted transfer failed: ${reason.slice(0, 120)}`, [
+        await postLedger(tx, intent.organizationId, intentId, `${execution.network}:${execution.transactionHash}:reversal`, `Submitted transfer failed: ${reason.slice(0, 120)}`, [
           { treasuryId: intent.treasuryId, code: "treasury_asset", assetId: intent.assetId, direction: "debit", amount: intent.amountBaseUnits },
           { treasuryId: intent.treasuryId, code: "pending_outbound", assetId: intent.assetId, direction: "credit", amount: intent.amountBaseUnits }
         ]);
       }
-      if (fee && fee.feeBaseUnits > 0n) {
-        const nativeAsset = `${fee.network}/${nativeAssetIds[intent.chainFamily]}`;
-        await this.postLedger(tx, intent.organizationId, intentId, `${fee.network}:${fee.transactionHash}:fee`, "Network fee on failed transaction", [
-          { treasuryId: intent.treasuryId, code: "fee_expense", assetId: nativeAsset, direction: "debit", amount: fee.feeBaseUnits.toString() },
-          { treasuryId: intent.treasuryId, code: "treasury_asset", assetId: nativeAsset, direction: "credit", amount: fee.feeBaseUnits.toString() }
-        ]);
+      if (fee) {
+        const fees = costLines({ treasuryId: intent.treasuryId, governance: intent.governance, kind: intent.kind, chainFamily: intent.chainFamily, nativeAsset: `${fee.network}/${nativeAssetIds[intent.chainFamily]}`, transfersNative: false, amountBaseUnits: 0n, feeBaseUnits: fee.feeBaseUnits });
+        if (fees.length > 0) await postLedger(tx, intent.organizationId, intentId, `${fee.network}:${fee.transactionHash}:fee`, "Network fee on failed transaction", fees);
       }
       await tx`
         insert into audit_events (organization_id, actor_principal_id, action, resource_type, resource_id, payload_hash, data)
@@ -707,7 +763,7 @@ export class PostgresJobQueue {
   async getConfirmationContext(intentId: string): Promise<ConfirmationContext> {
     const rows = await this.sql<ConfirmationContext[]>`
       select i.id::text as "intentId", i.organization_id::text as "organizationId",
-        i.treasury_account_id::text as "treasuryId", i.network, t.chain_family as "chainFamily",
+        i.treasury_account_id::text as "treasuryId", i.network, t.chain_family as "chainFamily", t.governance, i.kind, t.address as "from",
         coalesce(e.compiled_payload->>'payTo', i.destination) as "to",
         i.asset_id as "assetId", jsonb_build_object('id', a.id, 'kind', a.kind, 'address', a.address, 'decimals', a.decimals) as asset,
         coalesce(e.compiled_payload->>'settledAmountBaseUnits', i.amount_base_units::text) as "amountBaseUnits",
@@ -726,7 +782,7 @@ export class PostgresJobQueue {
    * intent reconciled only when the chain shows the destination received the
    * intended amount; otherwise it stays `finalized` with a recorded break.
    */
-  async markFinalized(context: ConfirmationContext, receipt: { blockHeight: bigint; feeBaseUnits: bigint; confirmations: number; destinationDeltaBaseUnits?: bigint }): Promise<"reconciled" | "finalized"> {
+  async markFinalized(context: ConfirmationContext, receipt: { blockHeight: bigint; feeBaseUnits: bigint; confirmations: number; destinationDeltaBaseUnits?: bigint; sourceNativeSpentBaseUnits?: bigint }): Promise<"reconciled" | "finalized"> {
     return this.sql.begin(async (tx) => {
       const delta = receipt.destinationDeltaBaseUnits;
       const reconciled = delta !== undefined && delta === BigInt(context.amountBaseUnits);
@@ -740,17 +796,12 @@ export class PostgresJobQueue {
       if (moved.count === 0) return reconciled ? "reconciled" : "finalized";
       await this.event(tx, context.organizationId, context.intentId, "intent.finalized", { blockHeight: receipt.blockHeight.toString(), confirmations: receipt.confirmations, feeBaseUnits: receipt.feeBaseUnits.toString() });
       const reference = `${context.network}:${context.transactionHash}`;
-      await this.postLedger(tx, context.organizationId, context.intentId, `${reference}:finalized`, "Outbound transfer finalized", [
+      await postLedger(tx, context.organizationId, context.intentId, `${reference}:finalized`, "Outbound transfer finalized", [
         { treasuryId: context.treasuryId, code: "settled_expense", assetId: context.assetId, direction: "debit", amount: context.amountBaseUnits },
         { treasuryId: context.treasuryId, code: "pending_outbound", assetId: context.assetId, direction: "credit", amount: context.amountBaseUnits }
       ]);
-      if (receipt.feeBaseUnits > 0n) {
-        const nativeAsset = `${context.network}/${nativeAssetIds[context.chainFamily]}`;
-        await this.postLedger(tx, context.organizationId, context.intentId, `${reference}:fee`, "Network fee", [
-          { treasuryId: context.treasuryId, code: "fee_expense", assetId: nativeAsset, direction: "debit", amount: receipt.feeBaseUnits.toString() },
-          { treasuryId: context.treasuryId, code: "treasury_asset", assetId: nativeAsset, direction: "credit", amount: receipt.feeBaseUnits.toString() }
-        ]);
-      }
+      const fees = costLines({ treasuryId: context.treasuryId, governance: context.governance, kind: context.kind, chainFamily: context.chainFamily, nativeAsset: `${context.network}/${nativeAssetIds[context.chainFamily]}`, transfersNative: context.asset.kind === "native", amountBaseUnits: BigInt(context.amountBaseUnits), feeBaseUnits: receipt.feeBaseUnits, ...(receipt.sourceNativeSpentBaseUnits !== undefined ? { sourceNativeSpentBaseUnits: receipt.sourceNativeSpentBaseUnits } : {}) });
+      if (fees.length > 0) await postLedger(tx, context.organizationId, context.intentId, `${reference}:fee`, "Network fee", fees);
       if (reconciled) {
         await tx`update intents set status = 'reconciled', version = version + 1, updated_at = now() where id = ${context.intentId} and status = 'finalized'`;
         await this.event(tx, context.organizationId, context.intentId, "intent.reconciled", observed);
@@ -763,39 +814,6 @@ export class PostgresJobQueue {
       `;
       return "finalized";
     });
-  }
-
-  // Ledger helpers
-
-  private async account(tx: TransactionSql, organizationId: string, treasuryId: string, code: string, assetId: string): Promise<string> {
-    const names: Record<string, string> = { treasury_asset: "Treasury asset", pending_outbound: "Pending outbound", settled_expense: "Settled expense", fee_expense: "Network fees" };
-    const rows = await tx<{ id: string }[]>`
-      insert into ledger_accounts (organization_id, treasury_account_id, code, name, asset_id)
-      values (${organizationId}, ${treasuryId}, ${code}, ${names[code] ?? code}, ${assetId})
-      on conflict (organization_id, coalesce(treasury_account_id, '00000000-0000-0000-0000-000000000000'::uuid), code, asset_id) do update set name = excluded.name
-      returning id::text
-    `;
-    if (!rows[0]) throw new Error("Ledger account upsert failed");
-    return rows[0].id;
-  }
-
-  /** Posts a balanced set of entries once per external reference. */
-  private async postLedger(tx: TransactionSql, organizationId: string, intentId: string, reference: string, description: string, entries: { treasuryId: string; code: string; assetId: string; direction: "debit" | "credit"; amount: string }[]): Promise<boolean> {
-    const perAsset = new Map<string, bigint>();
-    for (const entry of entries) perAsset.set(entry.assetId, (perAsset.get(entry.assetId) ?? 0n) + (entry.direction === "debit" ? 1n : -1n) * BigInt(entry.amount));
-    for (const [assetId, net] of perAsset) if (net !== 0n) throw new Error(`Unbalanced ledger posting for ${assetId}`);
-    const rows = await tx<{ id: string }[]>`
-      insert into ledger_transactions (organization_id, intent_id, external_reference, description, effective_at)
-      values (${organizationId}, ${intentId}, ${reference}, ${description}, now())
-      on conflict (organization_id, external_reference) do nothing returning id::text
-    `;
-    const transactionId = rows[0]?.id;
-    if (!transactionId) return false;
-    for (const entry of entries) {
-      const accountId = await this.account(tx, organizationId, entry.treasuryId, entry.code, entry.assetId);
-      await tx`insert into ledger_entries (transaction_id, account_id, direction, amount_base_units) values (${transactionId}, ${accountId}, ${entry.direction}, ${entry.amount})`;
-    }
-    return true;
   }
 
   private async event(tx: TransactionSql, organizationId: string, intentId: string, eventType: string, data: Record<string, unknown>): Promise<void> {

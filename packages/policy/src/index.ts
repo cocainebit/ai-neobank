@@ -4,6 +4,8 @@ export interface PolicyContext {
   /** Base units of the intent's asset already committed today by the same principal. */
   spentTodayBaseUnits: string;
   now: Date;
+  /** Whether the destination is an active, owner-approved beneficiary on the intent's network. */
+  destinationIsBeneficiary?: boolean;
 }
 
 const units = (value: string) => BigInt(value);
@@ -34,6 +36,10 @@ export function evaluatePaymentIntent(
     !policy.allowedDestinations.some((allowed) => allowed.toLowerCase() === intent.destination.toLowerCase())
   ) {
     rejectionReasons.push("Destination is not allowed");
+  }
+
+  if (policy.requireBeneficiary && intent.kind === "transfer" && context.destinationIsBeneficiary !== true) {
+    rejectionReasons.push("Destination is not an approved beneficiary");
   }
 
   if (rejectionReasons.length > 0) return { outcome: "rejected", reasons: rejectionReasons };

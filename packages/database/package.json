@@ -19,7 +19,8 @@
   "dependencies": {
     "@ai-neobank/domain": "workspace:*",
     "postgres": "^3.4.7",
-    "@ai-neobank/policy": "workspace:*"
+    "@ai-neobank/policy": "workspace:*",
+    "bs58": "^5.0.0"
   },
   "devDependencies": {
     "tsx": "^4.20.5",

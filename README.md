@@ -50,10 +50,22 @@ real simulation, and human approval decide what gets signed.
   seller returns. A retry re-sends the same payload, which the network can only
   honour once. Agents can dry-run quotes with `POST /v1/agent/x402/quote`.
 
+- Receivables and payables. Invoices are matched automatically: Solana through
+  a Solana Pay reference key, EVM tokens through a sub-cent identifier in the
+  amount, or paid over x402 at a public invoice URL through a facilitator.
+  Beneficiaries become payable only with an owner's wallet signature over the
+  exact address, and a policy can require them. Recurring payments create
+  ordinary intents once per occurrence (missed occurrences are skipped and
+  recorded, not paid in a burst).
+- A chain indexer books every receipt into each treasury, opening from the
+  chain balance the first time it looks, and reconciles chain against ledger
+  after each sync (matched, in flight, or break). Execution costs are booked
+  where they were paid, including Solana rent for recipient token accounts.
+  Statements per treasury and asset come from the ledger, in JSON or CSV.
+
 ## Not yet
 
-A frontend on the real API, invoicing/beneficiaries/recurring/statements,
-HSM/KMS signing, devnet runs, CI. x402 from Safe or Squads treasuries is not
+A frontend on the real API, HSM/KMS signing, devnet runs, CI. x402 from Safe or Squads treasuries is not
 supported yet. The web app in `apps/web` is still the earlier fixture prototype.
 
 ## Run it locally

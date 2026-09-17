@@ -1,8 +1,8 @@
 import postgres, { type Sql, type TransactionSql } from "postgres";
 
 type Db = Sql | TransactionSql;
-import type { PaymentIntent, PolicyDefinition, PrincipalRole } from "@ai-neobank/domain";
-import { nativeAssetIds } from "@ai-neobank/domain";
+import type { PaymentIntent, PolicyDefinition, PolicyDefinitionInput, PrincipalRole } from "@ai-neobank/domain";
+import { nativeAssetIds, policyDefinitionSchema } from "@ai-neobank/domain";
 export { createPostgresJobQueue, PostgresJobQueue, ExecutionRejected, Deferred, type JobRecord, type ExecutionContext, type ConfirmationContext, type SimulationEvidence, type Simulator, type AssetShape, type PublishContext, type Publisher, type ProposalObservation, type Observer } from "./jobs.js";
 
 export interface OrganizationRecord {
@@ -598,20 +598,22 @@ export class PostgresControlPlaneStore {
 
   // Policies
 
-  async createPolicy(organizationId: string, input: { name: string; definition: PolicyDefinition; createdBy: string }): Promise<PolicyRecord> {
+  async createPolicy(organizationId: string, input: { name: string; definition: PolicyDefinitionInput; createdBy: string }): Promise<PolicyRecord> {
+    const definition = policyDefinitionSchema.parse(input.definition);
     return this.sql.begin(async (tx) => {
       const policies = await tx<{ id: string }[]>`insert into policies (organization_id, name) values (${organizationId}, ${input.name}) returning id::text`;
       const policy = policies[0];
       if (!policy) throw new Error("Policy insert returned no row");
-      await this.insertPolicyVersion(tx, organizationId, policy.id, 1, input.definition, input.createdBy);
-      await this.audit(tx, organizationId, input.createdBy, "policy.created", "policy", policy.id, { name: input.name, definition: input.definition });
+      await this.insertPolicyVersion(tx, organizationId, policy.id, 1, definition, input.createdBy);
+      await this.audit(tx, organizationId, input.createdBy, "policy.created", "policy", policy.id, { name: input.name, definition });
       const records = await this.readPolicies(tx, organizationId, policy.id);
       if (!records[0]) throw new Error("Policy read-back failed");
       return records[0];
     });
   }
 
-  async addPolicyVersion(organizationId: string, policyId: string, definition: PolicyDefinition, createdBy: string): Promise<PolicyRecord | null> {
+  async addPolicyVersion(organizationId: string, policyId: string, input: PolicyDefinitionInput, createdBy: string): Promise<PolicyRecord | null> {
+    const definition = policyDefinitionSchema.parse(input);
     return this.sql.begin(async (tx) => {
       const latest = await tx<{ version: number }[]>`select coalesce(max(version), 0) as version from policy_versions where policy_id = ${policyId} and organization_id = ${organizationId} for update`;
       if (!latest[0] || latest[0].version === 0) return null;
@@ -706,7 +708,7 @@ export class PostgresControlPlaneStore {
 
   // Intents and approvals
 
-  async createIntent(intent: PaymentIntent): Promise<{ record: IntentRecord; created: boolean }> {
+  async createIntent(intent: PaymentIntent, links: { beneficiaryId?: string } = {}): Promise<{ record: IntentRecord; created: boolean }> {
     return this.sql.begin(async (tx) => {
       const existing = await tx.unsafe<IntentRecord[]>(
         `select ${intentColumns} from intents where organization_id = $1 and requester_principal_id = $2 and idempotency_key = $3`,
@@ -720,6 +722,7 @@ export class PostgresControlPlaneStore {
       );
       const record = rows[0];
       if (!record) throw new Error("Intent insert returned no row");
+      if (links.beneficiaryId) await tx`update intents set beneficiary_id = ${links.beneficiaryId} where id = ${intent.id}`;
       await tx`
         insert into intent_events (organization_id, intent_id, sequence, event_type, actor_principal_id, data)
         values (${intent.organizationId}, ${intent.id}, 1, 'intent.received', ${intent.requesterId}, ${tx.json({ status: "received" })})
@@ -886,3 +889,6 @@ export type ControlPlaneStore = PostgresControlPlaneStore;
 export function createPostgresStore(databaseUrl: string): PostgresControlPlaneStore {
   return new PostgresControlPlaneStore(postgres(databaseUrl, { max: 10, idle_timeout: 20 }));
 }
+
+export { OperationsStore, OperationsError, type BeneficiaryRecord, type ScheduleRecord, type InvoiceRecord, type InvoiceLineItem, type InflowRecord, type ReconciliationRecord, type StatementRecord, type StatementLine } from "./operations.js";
+export { postLedger, ledgerNet, type LedgerLine, type LedgerAccountCode } from "./ledger.js";

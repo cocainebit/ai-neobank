@@ -2,6 +2,7 @@ import {
   createPostgresJobQueue,
   Deferred,
   ExecutionRejected,
+  OperationsStore,
   type ExecutionContext,
   type JobRecord,
   type PostgresJobQueue,
@@ -38,6 +39,18 @@ interface ExecutionPlan {
 
 interface Settlement { transactionHash: string; payTo: string; amountBaseUnits: string; observed?: Record<string, unknown> }
 
+export interface WorkerOptions {
+  /** Periodic work: chain sync for every active treasury on a configured network, and recurring payments. Off unless set. */
+  maintenance?: { syncIntervalMs: number; scheduleIntervalMs: number };
+  /** Upper bound on EVM blocks read per sync, so a long gap is caught up over several runs. */
+  evmMaxBlocksPerSync?: number;
+}
+
+export interface SyncResult {
+  treasuryId: string;
+  assets: { assetId: string; opened: boolean; inflows: number; reconciliation: string | null }[];
+}
+
 export interface WorkerHooks {
   /** Test seam: called after the signed transaction is persisted and before it is broadcast. Throwing simulates a crash. */
   beforeBroadcast?: (context: ExecutionContext, signed: SignedTransaction) => Promise<void>;
@@ -62,9 +75,41 @@ function directCompiledHash(context: { intentId: string; network: string; assetI
 }
 
 export class DurableWorker {
-  constructor(private readonly queue: PostgresJobQueue, private readonly chainConfig?: WorkerChainConfig, private readonly workerId = crypto.randomUUID(), private readonly hooks: WorkerHooks = {}) {}
+  private readonly operations: OperationsStore;
+  private lastSyncEnqueue = 0;
+  private lastScheduleEnqueue = 0;
+
+  constructor(private readonly queue: PostgresJobQueue, private readonly chainConfig?: WorkerChainConfig, private readonly workerId = crypto.randomUUID(), private readonly hooks: WorkerHooks = {}, private readonly options: WorkerOptions = {}) {
+    this.operations = new OperationsStore(queue.sql);
+  }
+
+  /** Enqueues periodic jobs once per interval bucket; dedupe keys keep several workers from doubling them. */
+  private async maintain(): Promise<void> {
+    const maintenance = this.options.maintenance;
+    if (!maintenance) return;
+    const now = Date.now();
+    if (now - this.lastScheduleEnqueue >= maintenance.scheduleIntervalMs) {
+      this.lastScheduleEnqueue = now;
+      await this.queue.enqueueJob(null, "schedules.enqueue", {}, `schedules:${Math.floor(now / maintenance.scheduleIntervalMs)}`);
+    }
+    if (now - this.lastSyncEnqueue >= maintenance.syncIntervalMs) {
+      this.lastSyncEnqueue = now;
+      const targets = await this.operations.listSyncTargets(this.configuredNetworks());
+      for (const target of targets) {
+        await this.queue.enqueueJob(target.organizationId, "treasury.sync", { treasuryId: target.treasuryId }, `sync:${target.treasuryId}:${Math.floor(now / maintenance.syncIntervalMs)}`);
+      }
+    }
+  }
+
+  private configuredNetworks(): string[] {
+    const networks: string[] = [];
+    if (this.chainConfig?.evm) networks.push(this.chainConfig.evm.network);
+    if (this.chainConfig?.solana) networks.push(this.chainConfig.solana.network);
+    return networks;
+  }
 
   async runOnce(): Promise<boolean> {
+    await this.maintain();
     await this.queue.pumpOutbox();
     const job = await this.queue.claim(this.workerId);
     if (!job) return false;
@@ -92,6 +137,13 @@ export class DurableWorker {
   }
 
   private async handle(job: JobRecord): Promise<void> {
+    if (job.type === "schedules.enqueue") { await this.enqueueSchedules(); return; }
+    if (job.type === "treasury.sync") {
+      const treasuryId = job.payload.treasuryId;
+      if (typeof treasuryId !== "string") throw new Error("treasury.sync requires treasuryId");
+      await this.syncTreasury(treasuryId);
+      return;
+    }
     const intentId = this.intentIdOf(job);
     switch (job.type) {
       case "intent.evaluate": return this.queue.evaluateIntent(intentId, this.chainConfig ? (input) => this.simulate(input) : undefined);
@@ -420,13 +472,78 @@ export class DurableWorker {
     };
   }
 
+  /** Creates intents for recurring payments that are due. */
+  enqueueSchedules(): Promise<number> {
+    return this.operations.enqueueDueSchedules();
+  }
+
+  /**
+   * Reads what arrived at a treasury since the last sync, books it (matching
+   * invoices on the way), and compares the chain balance with the ledger.
+   * The first sync of an asset books its current balance as the opening balance.
+   */
+  async syncTreasury(treasuryId: string): Promise<SyncResult> {
+    const target = (await this.operations.listSyncTargets(this.configuredNetworks())).find((candidate) => candidate.treasuryId === treasuryId);
+    if (!target) throw new Error(`Treasury ${treasuryId} is not active on a configured network`);
+    const result: SyncResult = { treasuryId, assets: [] };
+    for (const asset of target.assets) {
+      const resolved = resolvedAsset({ id: asset.id, kind: asset.kind, address: asset.address, decimals: asset.decimals });
+      const entry = { assetId: asset.id, opened: false, inflows: 0, reconciliation: null as string | null };
+      result.assets.push(entry);
+      const cursor = await this.operations.getCursor(treasuryId, asset.id);
+      const record = async (inflows: Awaited<ReturnType<SolanaAdapter["scanInflows"]>>["inflows"]) => {
+        for (const inflow of inflows) {
+          const recorded = await this.operations.recordInflow({ organizationId: target.organizationId, treasuryAccountId: treasuryId, network: target.network, assetId: asset.id, transactionHash: inflow.transactionHash, eventKey: inflow.eventKey, amountBaseUnits: inflow.amountBaseUnits.toString(), fromAddress: inflow.from, blockCursor: inflow.blockCursor, ...(inflow.accountKeys ? { accountKeys: inflow.accountKeys } : {}) });
+          if (recorded.created) entry.inflows += 1;
+        }
+      };
+      if (target.chainFamily === "evm") {
+        const evm = this.evm(target.network);
+        const safeHead = await evm.safeHead();
+        if (cursor === null) {
+          entry.opened = await this.operations.openCursor({ organizationId: target.organizationId, treasuryId, assetId: asset.id, cursor: safeHead.toString(), chainBalanceBaseUnits: await evm.getBalanceAt(target.address, resolved, safeHead) });
+        } else {
+          const from = BigInt(cursor) + 1n;
+          const to = [safeHead, BigInt(cursor) + BigInt(this.options.evmMaxBlocksPerSync ?? 2_000)].reduce((a, b) => (a < b ? a : b));
+          if (from <= to) {
+            await record(resolved.kind === "native" ? await evm.scanNativeInflows(target.address, from, to) : await evm.scanTokenInflows(resolved.kind === "erc20" ? resolved.address : "", target.address, from, to));
+            await this.operations.advanceCursor(treasuryId, asset.id, to.toString());
+          }
+          if (to < safeHead) continue;
+        }
+        const reconciliation = await this.operations.recordReconciliation({ organizationId: target.organizationId, treasuryId, assetId: asset.id, chainBalanceBaseUnits: await evm.getBalanceAt(target.address, resolved, safeHead) });
+        entry.reconciliation = reconciliation.status;
+        continue;
+      }
+      const solana = this.solana(target.network);
+      const watched = solana.watchAddress(target.address, resolved);
+      let newest: string | null;
+      if (cursor === null) {
+        const opening = await solana.getFinalizedBalance(target.address, resolved);
+        newest = await solana.signatureAtOrBefore(watched, opening.slot);
+        entry.opened = await this.operations.openCursor({ organizationId: target.organizationId, treasuryId, assetId: asset.id, cursor: newest ?? "none", chainBalanceBaseUnits: opening.balance });
+      } else {
+        const scanned = await solana.scanInflows(target.address, resolved, cursor === "none" ? null : cursor);
+        await record(scanned.inflows);
+        newest = scanned.newest;
+        if (newest && newest !== cursor) await this.operations.advanceCursor(treasuryId, asset.id, newest);
+      }
+      const { balance } = await solana.getFinalizedBalance(target.address, resolved);
+      // Only compare when nothing new landed between the scan and the balance read.
+      if ((await solana.newestSignature(watched)) !== newest) { entry.reconciliation = "moving"; continue; }
+      const reconciliation = await this.operations.recordReconciliation({ organizationId: target.organizationId, treasuryId, assetId: asset.id, chainBalanceBaseUnits: balance });
+      entry.reconciliation = reconciliation.status;
+    }
+    return result;
+  }
+
   private async confirm(intentId: string): Promise<void> {
     const context = await this.queue.getConfirmationContext(intentId);
     const adapter = this.adapterFor(context.chainFamily, context.network);
     const asset = resolvedAsset(context.asset);
     let receipt;
     try {
-      receipt = await adapter.waitForTransaction(context.transactionHash, { to: context.to, asset, amountBaseUnits: BigInt(context.amountBaseUnits) });
+      receipt = await adapter.waitForTransaction(context.transactionHash, { to: context.to, asset, amountBaseUnits: BigInt(context.amountBaseUnits), from: context.from });
     } catch (error) {
       // Not yet visible at the queried commitment; look again shortly.
       throw new Deferred(error instanceof Error ? error.message : "Transaction not yet visible", 3);
@@ -440,7 +557,7 @@ export class DurableWorker {
   }
 }
 
-export function createWorker(databaseUrl: string, chainConfig?: WorkerChainConfig, hooks?: WorkerHooks): { worker: DurableWorker; queue: PostgresJobQueue; close: () => Promise<void> } {
+export function createWorker(databaseUrl: string, chainConfig?: WorkerChainConfig, hooks?: WorkerHooks, options?: WorkerOptions): { worker: DurableWorker; queue: PostgresJobQueue; close: () => Promise<void> } {
   const queue = createPostgresJobQueue(databaseUrl);
-  return { worker: new DurableWorker(queue, chainConfig, undefined, hooks), queue, close: () => queue.close() };
+  return { worker: new DurableWorker(queue, chainConfig, undefined, hooks, options), queue, close: () => queue.close() };
 }

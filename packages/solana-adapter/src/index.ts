@@ -2,6 +2,7 @@ import type {
   AdapterHealth,
   BroadcastStatus,
   ChainAdapter,
+  ObservedInflow,
   ResolvedAsset,
   SignedTransaction,
   SubmittedTransaction,
@@ -174,6 +175,77 @@ export class SolanaAdapter implements ChainAdapter {
     }
   }
 
+  /** Balance of an asset at finalized commitment together with the slot it was read at. */
+  async getFinalizedBalance(address: string, asset: ResolvedAsset): Promise<{ balance: bigint; slot: number }> {
+    if (asset.kind === "native") {
+      const response = await this.connection.getBalanceAndContext(new PublicKey(address), "finalized");
+      return { balance: BigInt(response.value), slot: response.context.slot };
+    }
+    if (asset.kind !== "spl") throw new Error(`Asset kind ${asset.kind} is not a Solana asset`);
+    const ata = getAssociatedTokenAddressSync(new PublicKey(asset.mint), new PublicKey(address), true);
+    const info = await this.connection.getAccountInfoAndContext(ata, "finalized");
+    if (!info.value) return { balance: 0n, slot: info.context.slot };
+    const balance = await this.connection.getTokenAccountBalance(ata, "finalized");
+    return { balance: BigInt(balance.value.amount), slot: balance.context.slot };
+  }
+
+  /** The address whose history holds receipts of this asset: the owner for SOL, its associated token account for SPL. */
+  watchAddress(owner: string, asset: ResolvedAsset): string {
+    if (asset.kind === "native") return owner;
+    if (asset.kind !== "spl") throw new Error(`Asset kind ${asset.kind} is not a Solana asset`);
+    return getAssociatedTokenAddressSync(new PublicKey(asset.mint), new PublicKey(owner), true).toBase58();
+  }
+
+  /** Newest finalized signature touching the address at or before a slot, or null when it has no history yet. */
+  async signatureAtOrBefore(address: string, slot: number): Promise<string | null> {
+    const signatures = await this.connection.getSignaturesForAddress(new PublicKey(address), { limit: 50 }, "finalized");
+    return signatures.find((entry) => entry.slot <= slot)?.signature ?? null;
+  }
+
+  async newestSignature(address: string): Promise<string | null> {
+    const signatures = await this.connection.getSignaturesForAddress(new PublicKey(address), { limit: 1 }, "finalized");
+    return signatures[0]?.signature ?? null;
+  }
+
+  /**
+   * Finalized receipts into `owner` newer than `untilSignature`, oldest first.
+   * Transactions where the owner's balance of the asset went down or stayed
+   * flat are skipped; those are outbound and booked by execution.
+   */
+  async scanInflows(owner: string, asset: ResolvedAsset, untilSignature: string | null, limit = 500): Promise<{ inflows: ObservedInflow[]; newest: string | null }> {
+    const watched = new PublicKey(this.watchAddress(owner, asset));
+    const signatures = await this.connection.getSignaturesForAddress(watched, { limit, ...(untilSignature ? { until: untilSignature } : {}) }, "finalized");
+    const inflows: ObservedInflow[] = [];
+    for (const entry of [...signatures].reverse()) {
+      if (entry.err) continue;
+      const transaction = await this.connection.getTransaction(entry.signature, { commitment: "finalized", maxSupportedTransactionVersion: 0 });
+      if (!transaction?.meta) continue;
+      const loaded = transaction.meta.loadedAddresses;
+      const keys = transaction.transaction.message.getAccountKeys(loaded ? { accountKeysFromLookups: loaded } : undefined).keySegments().flat().map((key) => key.toBase58());
+      let received = 0n;
+      let from: string | null = null;
+      if (asset.kind === "native") {
+        const index = keys.indexOf(owner);
+        if (index < 0) continue;
+        received = BigInt(transaction.meta.postBalances[index] ?? 0) - BigInt(transaction.meta.preBalances[index] ?? 0);
+        let largestDrop = 0n;
+        keys.forEach((key, keyIndex) => {
+          const drop = BigInt(transaction.meta!.preBalances[keyIndex] ?? 0) - BigInt(transaction.meta!.postBalances[keyIndex] ?? 0);
+          if (key !== owner && drop > largestDrop) { largestDrop = drop; from = key; }
+        });
+      } else if (asset.kind === "spl") {
+        const mint = asset.mint;
+        const amountOf = (list: typeof transaction.meta.postTokenBalances, who: string) => BigInt(list?.find((item) => item.owner === who && item.mint === mint)?.uiTokenAmount.amount ?? "0");
+        received = amountOf(transaction.meta.postTokenBalances, owner) - amountOf(transaction.meta.preTokenBalances, owner);
+        const sender = (transaction.meta.preTokenBalances ?? []).find((item) => item.mint === mint && item.owner && item.owner !== owner && amountOf(transaction.meta!.preTokenBalances, item.owner) > amountOf(transaction.meta!.postTokenBalances, item.owner));
+        from = sender?.owner ?? null;
+      }
+      if (received <= 0n) continue;
+      inflows.push({ transactionHash: entry.signature, eventKey: asset.kind === "spl" ? `spl:${asset.mint}` : "native", amountBaseUnits: received, from, blockCursor: String(entry.slot), accountKeys: keys });
+    }
+    return { inflows, newest: signatures[0]?.signature ?? untilSignature };
+  }
+
   /** The raw connection, for adapters layered on top (Squads). */
   get rpc(): Connection {
     return this.connection;
@@ -193,7 +265,7 @@ export class SolanaAdapter implements ChainAdapter {
     return { state: "unseen_dead", reason: "Blockhash expired before the transaction landed" };
   }
 
-  async waitForTransaction(hash: string, expected?: { to: string; asset: ResolvedAsset; amountBaseUnits: bigint }): Promise<TransactionReceipt> {
+  async waitForTransaction(hash: string, expected?: { to: string; asset: ResolvedAsset; amountBaseUnits: bigint; from?: string }): Promise<TransactionReceipt> {
     const statuses = await this.connection.getSignatureStatuses([hash], { searchTransactionHistory: true });
     const status = statuses.value[0];
     if (!status) throw new Error("Transaction is not known to the cluster");
@@ -217,6 +289,15 @@ export class SolanaAdapter implements ChainAdapter {
       const loaded = transaction.meta.loadedAddresses;
       const accountKeys = transaction.transaction.message.getAccountKeys(loaded ? { accountKeysFromLookups: loaded } : undefined);
       const keys = accountKeys.keySegments().flat().map((key) => key.toBase58());
+      if (expected.from) {
+        const fromIndex = keys.indexOf(expected.from);
+        if (fromIndex >= 0) {
+          const spent = BigInt(transaction.meta.preBalances[fromIndex] ?? 0) - BigInt(transaction.meta.postBalances[fromIndex] ?? 0);
+          result.sourceNativeSpentBaseUnits = spent > 0n ? spent : 0n;
+        } else {
+          result.sourceNativeSpentBaseUnits = 0n;
+        }
+      }
       if (expected.asset.kind === "native") {
         const index = keys.indexOf(expected.to);
         if (index >= 0) result.destinationDeltaBaseUnits = BigInt(transaction.meta.postBalances[index] ?? 0) - BigInt(transaction.meta.preBalances[index] ?? 0);

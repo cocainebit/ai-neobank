@@ -1,0 +1,52 @@
+# Relay on Fly: one image, an HTTP process for the API and a background process
+# for the worker. Chains are public test networks; see docs for the key posture.
+app = "relay-neobank"
+primary_region = "iad"
+
+[build]
+
+[processes]
+  api = "node apps/api/dist/server.js"
+  worker = "node apps/worker/dist/main.js"
+
+[deploy]
+  release_command = "node packages/database/dist/migrate.js"
+
+[env]
+  HOST = "0.0.0.0"
+  PORT = "8080"
+  RELAY_ENVIRONMENT = "development"
+  ALLOW_SOFTWARE_SIGNERS = "true"
+  EVM_RPC_URL = "https://sepolia.base.org"
+  EVM_CHAIN_ID = "84532"
+  EVM_CONFIRMATIONS = "2"
+  SOLANA_RPC_URL = "https://api.devnet.solana.com"
+  SOLANA_NETWORK = "solana:devnet"
+  SOLANA_FINALITY = "finalized"
+  WORKER_POLL_MS = "1000"
+  SYNC_INTERVAL_MS = "30000"
+  SCHEDULE_INTERVAL_MS = "60000"
+  EVM_MAX_BLOCKS_PER_SYNC = "2000"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "suspend"
+  auto_start_machines = true
+  min_machines_running = 1
+  processes = ["api"]
+
+  [http_service.concurrency]
+    type = "requests"
+    hard_limit = 200
+    soft_limit = 150
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
+  processes = ["api"]
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
+  processes = ["worker"]

@@ -149,6 +149,17 @@ test:e2e` (Playwright against the running stack), `pnpm test:integration` (build
 migrates, then runs database, EVM, Solana, worker, API, and Safe suites against
 the local chains). `pnpm localnet:down` stops the services by recorded PID.
 
+## Deploying
+
+`Dockerfile` and `fly.toml` run the API and the worker as two processes from one
+image on Fly, with the console on Vercel pointed at the API through
+`RELAY_API_URL`. The committed configuration targets public test networks (Base
+Sepolia, Solana devnet) and `RELAY_ENVIRONMENT=development`, because software
+signers are only allowed outside production; a production deployment needs
+KMS-wrapped signers and `ALLOW_SOFTWARE_SIGNERS=false`. Secrets to set on the
+host: `DATABASE_URL`, `SIGNER_KEYRING`, `SIGNER_ACTIVE_KEY_VERSION`,
+`AUTH_DOMAIN`, `AUTH_URI`, and `WEB_ORIGIN`.
+
 ## Layout
 
 `apps/api` (Fastify HTTP API), `apps/worker` (durable jobs: evaluate, expire,

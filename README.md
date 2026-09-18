@@ -40,6 +40,14 @@ real simulation, and human approval decide what gets signed.
   builds for their wallets; the worker mirrors on-chain votes and executes once
   the program marks the proposal approved.
 
+- x402 from a Safe. A Safe cannot sign an EIP-3009 authorization, so Relay fixes
+  the authorization before anyone approves (its nonce derives from the intent, so
+  one intent can only ever authorise one payment), asks the owners to sign a Safe
+  message over that authorization's digest, and assembles their signatures into
+  the Safe's own signature. The facilitator verifies it through ERC-1271 and
+  settles with the token's bytes-signature entry point, so the token must accept
+  contract signatures (USDC 2.2 does). Relay signs nothing and pays no gas.
+
 - x402 (v2, `exact` scheme) machine payments from direct treasuries: an agent
   submits an intent whose destination is the resource URL and whose amount is
   the most it may pay; intake fetches the 402, selects the option on the
@@ -99,11 +107,10 @@ test skips until a funded key is configured) and CI that has actually run: `.git
 no remote yet. KMS signing covers EVM keys;
 Solana signers use KMS-wrapped envelopes. The KMS integration is verified
 against the AWS SDK's own command objects and an in-process KMS stand-in,
-not yet against a live AWS account. x402 from Safe or Squads treasuries is not
-supported: the `exact` scheme needs a signature from the payer itself, so a
-Squads vault (a program address that cannot sign) is out of reach entirely, and
-a Safe would need Relay to collect owner signatures over an EIP-712 Safe message
-and a token whose `transferWithAuthorization` accepts ERC-1271 signatures. An EVM invoice must be in a token: a native transfer into a Safe
+not yet against a live AWS account. x402 from a Squads vault is not possible:
+the `exact` scheme needs a signature from the payer itself and a vault is a
+program address that cannot sign, so Relay refuses those intents at intake with
+that reason. An EVM invoice must be in a token: a native transfer into a Safe
 cannot be attributed to an invoice.
 
 ## Run it locally
@@ -128,6 +135,13 @@ against a `relay_dev` database, with development wallets enabled:
 scripts/localnet.sh up   # also deploys Safe 1.4.1 singletons and a test token to Anvil
 # write .local/dev.env (see .env.example; it must set SIGNER_KEYRING)
 scripts/dev.sh up        # scripts/dev.sh logs | down
+```
+
+To exercise x402 by hand, run a local seller that prices a resource in the
+fixture's EIP-3009 token and settles on Anvil:
+
+```sh
+pnpm --filter @ai-neobank/worker exec tsx src/dev-seller.ts <token address> 8728
 ```
 
 Checks: `pnpm typecheck`, `pnpm test` (unit), `pnpm --filter @ai-neobank/web

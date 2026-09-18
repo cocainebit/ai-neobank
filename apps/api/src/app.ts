@@ -24,7 +24,7 @@ import {
 } from "@ai-neobank/auth";
 import { EvmAdapter } from "@ai-neobank/evm-adapter";
 import { SolanaAdapter } from "@ai-neobank/solana-adapter";
-import { SafeGovernanceAdapter, recoverSafeSigner, safeTypedDataJson, type CompiledSafeTransaction, type SafeContractAddresses } from "@ai-neobank/safe-adapter";
+import { SafeGovernanceAdapter, recoverSafeMessageSigner, recoverSafeSigner, safeMessageTypedDataJson, safeTypedDataJson, type CompiledSafeTransaction, type SafeContractAddresses } from "@ai-neobank/safe-adapter";
 import { SquadsGovernanceAdapter } from "@ai-neobank/squads-adapter";
 import { X402PaymentClient, X402QuoteError, solanaWireNetwork } from "@ai-neobank/x402-adapter";
 import type { ResolvedAsset } from "@ai-neobank/chain-core";
@@ -759,7 +759,13 @@ export function buildApp(options: AppOptions) {
     if (!detail?.approval?.compiledHash || !detail.approval.simulationHash) return reply.code(404).send({ error: "approval_not_found" });
     const treasury = await store.getTreasury(auth.organizationId, detail.intent.treasuryAccountId);
     const base = { expectedIntentVersion: detail.intent.version, compiledHash: detail.approval.compiledHash, simulationHash: detail.approval.simulationHash };
-    const ref = detail.approval.externalRef as { kind?: string; safeTx?: CompiledSafeTransaction; safeAddress?: string; chainId?: number; multisigPda?: string; transactionIndex?: string; proposalPda?: string } | null;
+    const ref = detail.approval.externalRef as { kind?: string; safeTx?: CompiledSafeTransaction; safeAddress?: string; chainId?: number; multisigPda?: string; transactionIndex?: string; proposalPda?: string; digest?: string; safeMessageHash?: string } | null;
+    if (treasury?.governance === "safe" && ref?.kind === "safe_x402" && ref.safeAddress && ref.digest) {
+      // The Safe cannot sign the payment itself: owners sign a Safe message over the
+      // authorization's digest, and the token accepts it through ERC-1271.
+      if (decision.data === "rejected") return { data: { kind: "plain", ...base, message: buildApprovalMessage({ domain: options.auth.domain, intentId: id.data, version: detail.intent.version, decision: "rejected", compiledHash: detail.approval.compiledHash, simulationHash: detail.approval.simulationHash }) } };
+      return { data: { kind: "eip712", ...base, safeMessageHash: ref.safeMessageHash, typedData: safeMessageTypedDataJson(ref.chainId ?? options.chains?.evm?.chainId ?? 1, ref.safeAddress, ref.digest) } };
+    }
     if (treasury?.governance === "safe" && ref?.safeTx && ref.safeAddress) {
       if (decision.data === "rejected") return { data: { kind: "plain", ...base, message: buildApprovalMessage({ domain: options.auth.domain, intentId: id.data, version: detail.intent.version, decision: "rejected", compiledHash: detail.approval.compiledHash, simulationHash: detail.approval.simulationHash }) } };
       return { data: { kind: "eip712", ...base, safeTxHash: ref.safeTx.safeTxHash, typedData: safeTypedDataJson(ref.chainId ?? options.chains?.evm?.chainId ?? 1, ref.safeAddress, ref.safeTx) } };
@@ -806,8 +812,17 @@ export function buildApp(options: AppOptions) {
       if (!body.success) return invalid(reply, body.error.flatten());
       let signedPayload: string | undefined;
       let signerAddress: string | undefined;
-      const ref = detail.approval?.externalRef as { safeTx?: CompiledSafeTransaction; owners?: string[] } | null;
-      if (treasury?.governance === "safe" && decision === "approved") {
+      const ref = detail.approval?.externalRef as { kind?: string; safeTx?: CompiledSafeTransaction; owners?: string[]; safeMessageHash?: string } | null;
+      if (treasury?.governance === "safe" && ref?.kind === "safe_x402" && decision === "approved") {
+        if (!body.data.signature) return reply.code(400).send({ error: "owner_signature_required" });
+        if (!wallet || wallet.chainFamily !== "evm") return reply.code(403).send({ error: "no_wallet_bound" });
+        if (!ref.safeMessageHash || !ref.owners) return reply.code(409).send({ error: "safe_authorization_not_prepared" });
+        const recovered = await recoverSafeMessageSigner(ref.safeMessageHash, body.data.signature).catch(() => null);
+        if (!recovered || recovered.toLowerCase() !== wallet.address.toLowerCase()) return reply.code(401).send({ error: "approval_signature_invalid" });
+        if (!ref.owners.map((owner) => owner.toLowerCase()).includes(recovered.toLowerCase())) return reply.code(403).send({ error: "wallet_is_not_a_safe_owner" });
+        signedPayload = body.data.signature;
+        signerAddress = recovered;
+      } else if (treasury?.governance === "safe" && decision === "approved") {
         // Safe: the approval is the owner's EIP-712 signature; it must come from this principal's wallet and that wallet must own the Safe.
         if (!body.data.signature) return reply.code(400).send({ error: "owner_signature_required" });
         if (!wallet || wallet.chainFamily !== "evm") return reply.code(403).send({ error: "no_wallet_bound" });

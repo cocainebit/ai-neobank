@@ -659,7 +659,10 @@ export class PostgresControlPlaneStore {
   async addPolicyVersion(organizationId: string, policyId: string, input: PolicyDefinitionInput, createdBy: string): Promise<PolicyRecord | null> {
     const definition = policyDefinitionSchema.parse(input);
     return this.sql.begin(async (tx) => {
-      const latest = await tx<{ version: number }[]>`select coalesce(max(version), 0) as version from policy_versions where policy_id = ${policyId} and organization_id = ${organizationId} for update`;
+      // Lock the policy row, not the aggregate: Postgres refuses FOR UPDATE with max().
+      const locked = await tx<{ id: string }[]>`select id from policies where id = ${policyId} and organization_id = ${organizationId} for update`;
+      if (!locked[0]) return null;
+      const latest = await tx<{ version: number }[]>`select coalesce(max(version), 0) as version from policy_versions where policy_id = ${policyId} and organization_id = ${organizationId}`;
       if (!latest[0] || latest[0].version === 0) return null;
       await tx`update policy_versions set status = 'retired' where policy_id = ${policyId} and status = 'active'`;
       const versionId = await this.insertPolicyVersion(tx, organizationId, policyId, latest[0].version + 1, definition, createdBy);

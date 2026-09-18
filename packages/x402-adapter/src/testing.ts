@@ -79,7 +79,7 @@ export interface LocalSeller {
 }
 
 /** A seller that prices routes in the local test token and serves JSON once the facilitator settles. */
-export async function startLocalSeller(facilitator: FacilitatorClient, routes: SellerRoute[], options: { evm?: { rpcUrl: string }; solana?: { rpcUrl: string; wireNetwork: string } } = {}): Promise<LocalSeller> {
+export async function startLocalSeller(facilitator: FacilitatorClient, routes: SellerRoute[], options: { evm?: { rpcUrl: string }; solana?: { rpcUrl: string; wireNetwork: string } } = {}, port = 0): Promise<LocalSeller> {
   const server = new x402ResourceServer(facilitator);
   if (options.evm) registerExmServer(server);
   if (options.solana) registerSvmServer(server, { networks: [options.solana.wireNetwork as `${string}:${string}`] } as never);
@@ -94,8 +94,8 @@ export async function startLocalSeller(facilitator: FacilitatorClient, routes: S
     const [method, path] = route.route.split(" ");
     (app as unknown as Record<string, (path: string, handler: express.RequestHandler) => void>)[(method ?? "GET").toLowerCase()]!(path ?? "/", (_request, response) => { response.json(route.body); });
   }
-  const listener = await new Promise<Server>((resolve) => { const instance = app.listen(0, "127.0.0.1", () => resolve(instance)); });
+  const listener = await new Promise<Server>((resolve) => { const instance = app.listen(port, "127.0.0.1", () => resolve(instance)); });
   const address = listener.address();
-  const port = typeof address === "object" && address ? address.port : 0;
-  return { url: `http://127.0.0.1:${port}`, close: () => new Promise((resolve, reject) => listener.close((error) => (error ? reject(error) : resolve()))) };
+  const bound = typeof address === "object" && address ? address.port : port;
+  return { url: `http://127.0.0.1:${bound}`, close: () => new Promise((resolve, reject) => listener.close((error) => (error ? reject(error) : resolve()))) };
 }

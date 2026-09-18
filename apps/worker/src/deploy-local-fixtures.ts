@@ -9,13 +9,19 @@ import { createPublicClient, createWalletClient, http, type Address, type Hex } 
 import { privateKeyToAccount } from "viem/accounts";
 import { deploySafeProtocolFixture, type SafeContractAddresses } from "@ai-neobank/safe-adapter";
 
-interface Fixtures { safe: SafeContractAddresses; token: { address: Address; symbol: string; decimals: number } }
+interface Fixtures {
+  safe: SafeContractAddresses;
+  token: { address: Address; symbol: string; decimals: number };
+  /** An EIP-3009 token with ERC-1271 support, so x402 (including from a Safe) can be exercised locally. */
+  x402Token: { address: Address; symbol: string; decimals: number };
+}
 
 const rpcUrl = process.env.EVM_RPC_URL ?? "http://127.0.0.1:8722";
 const output = new URL("../../../.local/local-fixtures.json", import.meta.url);
 // Anvil's first default account: a published key, funded only on local chains.
 const anvilKey = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80" as Hex;
 const erc20 = JSON.parse(readFileSync(new URL("../../../packages/evm-adapter/fixtures/TestToken.json", import.meta.url), "utf8")) as { abi: readonly unknown[]; bytecode: Hex };
+const erc3009 = JSON.parse(readFileSync(new URL("../../../packages/evm-adapter/fixtures/TestUSD3009.json", import.meta.url), "utf8")) as { abi: readonly unknown[]; bytecode: Hex };
 
 const client = createPublicClient({ transport: http(rpcUrl) });
 const chainId = await client.getChainId();
@@ -42,14 +48,23 @@ const [symbol, decimals] = await Promise.all([
   client.readContract({ address: token, abi: erc20.abi as never, functionName: "decimals" }) as Promise<number>
 ]);
 
-const fixtures: Fixtures = { safe, token: { address: token, symbol, decimals } };
+const x402Hash = await wallet.deployContract({ abi: erc3009.abi as never, bytecode: erc3009.bytecode, account, chain });
+const x402Token = (await client.waitForTransactionReceipt({ hash: x402Hash })).contractAddress as Address;
+const x402MintHash = await wallet.writeContract({ address: x402Token, abi: erc3009.abi as never, functionName: "mint", args: [account.address, 100_000_000_000n], account, chain });
+await client.waitForTransactionReceipt({ hash: x402MintHash });
+const [x402Symbol, x402Decimals] = await Promise.all([
+  client.readContract({ address: x402Token, abi: erc3009.abi as never, functionName: "symbol" }) as Promise<string>,
+  client.readContract({ address: x402Token, abi: erc3009.abi as never, functionName: "decimals" }) as Promise<number>
+]);
+
+const fixtures: Fixtures = { safe, token: { address: token, symbol, decimals }, x402Token: { address: x402Token, symbol: x402Symbol, decimals: x402Decimals } };
 writeFileSync(output, JSON.stringify(fixtures, null, 2));
-console.log(`Deployed Safe contracts (singleton ${safe.safeSingletonAddress}) and ${symbol} at ${token}`);
+console.log(`Deployed Safe contracts (singleton ${safe.safeSingletonAddress}), ${symbol} at ${token}, and the EIP-3009 token at ${x402Token}`);
 
 async function readExisting(): Promise<Fixtures | null> {
   let parsed: Fixtures;
   try { parsed = JSON.parse(readFileSync(output, "utf8")) as Fixtures; } catch { return null; }
-  if (!parsed.safe?.safeSingletonAddress || !parsed.token?.address) return null;
-  const [safeCode, tokenCode] = await Promise.all([client.getCode({ address: parsed.safe.safeSingletonAddress as Address }), client.getCode({ address: parsed.token.address })]);
-  return safeCode && safeCode !== "0x" && tokenCode && tokenCode !== "0x" ? parsed : null;
+  if (!parsed.safe?.safeSingletonAddress || !parsed.token?.address || !parsed.x402Token?.address) return null;
+  const [safeCode, tokenCode, x402Code] = await Promise.all([client.getCode({ address: parsed.safe.safeSingletonAddress as Address }), client.getCode({ address: parsed.token.address }), client.getCode({ address: parsed.x402Token.address })]);
+  return [safeCode, tokenCode, x402Code].every((code) => code && code !== "0x") ? parsed : null;
 }

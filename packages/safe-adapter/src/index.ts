@@ -1,6 +1,6 @@
 import Safe, { buildSignatureBytes, EthSafeSignature } from "@safe-global/protocol-kit";
 import { OperationType, type SafeTransaction, type SafeTransactionData } from "@safe-global/types-kit";
-import { createPublicClient, createWalletClient, defineChain, encodeFunctionData, erc20Abi, http, parseAbi, recoverAddress, type Address, type Hex } from "viem";
+import { concatHex, createPublicClient, createWalletClient, defineChain, encodeFunctionData, erc20Abi, getAddress, hashTypedData, http, parseAbi, recoverAddress, type Address, type Hex } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { createRequire } from "node:module";
 import { randomBytes } from "node:crypto";
@@ -106,6 +106,62 @@ export function safeTypedDataJson(chainId: number, safeAddress: string, compiled
     types: { EIP712Domain: [{ name: "chainId", type: "uint256" }, { name: "verifyingContract", type: "address" }], ...typed.types },
     message: { ...typed.message, value: typed.message.value.toString(), safeTxGas: typed.message.safeTxGas.toString(), baseGas: typed.message.baseGas.toString(), gasPrice: typed.message.gasPrice.toString(), nonce: typed.message.nonce.toString() }
   };
+}
+
+export const safeMessageTypes = {
+  SafeMessage: [{ name: "message", type: "bytes" }]
+} as const;
+
+/**
+ * What a Safe owner signs to make the Safe itself vouch for an arbitrary hash.
+ * The Safe's fallback handler answers ERC-1271 for `dataHash` by checking owner
+ * signatures over this SafeMessage, so this is how a Safe authorises an EIP-3009
+ * payment it can never sign itself.
+ */
+export function safeMessageTypedData(chainId: number, safeAddress: string, dataHash: string) {
+  return {
+    domain: { chainId, verifyingContract: getAddress(safeAddress) },
+    types: safeMessageTypes,
+    primaryType: "SafeMessage" as const,
+    // The fallback handler hashes abi.encode(dataHash), which for a bytes32 is the hash itself.
+    message: { message: dataHash as Hex }
+  };
+}
+
+/** The same payload as JSON, for eth_signTypedData_v4 in a browser wallet. */
+export function safeMessageTypedDataJson(chainId: number, safeAddress: string, dataHash: string) {
+  const typed = safeMessageTypedData(chainId, safeAddress, dataHash);
+  return { ...typed, types: { EIP712Domain: [{ name: "chainId", type: "uint256" }, { name: "verifyingContract", type: "address" }], ...typed.types } };
+}
+
+/** The digest an owner's wallet actually signs, and the hash the Safe checks signatures against. */
+export function safeMessageHash(chainId: number, safeAddress: string, dataHash: string): Hex {
+  return hashTypedData(safeMessageTypedData(chainId, safeAddress, dataHash));
+}
+
+/** Recovers the owner that signed a Safe message digest. */
+export async function recoverSafeMessageSigner(messageHash: string, signature: string): Promise<string> {
+  return recoverAddress({ hash: messageHash as Hex, signature: signature as Hex });
+}
+
+/**
+ * Owner signatures concatenated the way `checkSignatures` expects: ascending by
+ * owner address, 65 bytes each, with v normalised to 27/28.
+ */
+export function encodeSafeOwnerSignatures(signatures: OwnerSignature[]): Hex {
+  const ordered = [...signatures].sort((a, b) => (getAddress(a.owner).toLowerCase() < getAddress(b.owner).toLowerCase() ? -1 : 1));
+  const blob = concatHex(ordered.map((entry) => {
+    const raw = entry.signature.startsWith("0x") ? entry.signature.slice(2) : entry.signature;
+    if (raw.length !== 130) throw new Error(`Owner signature for ${entry.owner} is not 65 bytes`);
+    let v = Number.parseInt(raw.slice(128), 16);
+    if (v < 27) v += 27;
+    return `0x${raw.slice(0, 128)}${v.toString(16).padStart(2, "0")}` as Hex;
+  }));
+  // A one-of-one Safe would otherwise produce exactly 65 bytes, which verifiers
+  // read as an EOA signature and try to ecrecover. The Safe reads only the first
+  // `threshold` 65-byte slots, so a trailing byte is ignored on chain and keeps
+  // the blob unmistakably a contract signature.
+  return blob.length === 132 ? `${blob}00` as Hex : blob;
 }
 
 /** Recovers the owner that signed the Safe transaction hash with signTypedData. */

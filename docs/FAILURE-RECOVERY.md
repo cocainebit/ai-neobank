@@ -22,6 +22,7 @@ never a reason to declare a payment dead or to send it again.
 | Nobody approves before the intent expires | The intent expires with no execution row | `recovery.test.ts` expiry drill |
 | Signed transaction can never land (nonce consumed elsewhere) | The intent fails cleanly, with the reason | `integration.test.ts` dead-nonce case |
 | A treasury holds an asset whose contract is unreadable | That asset is skipped with an error; the treasury's other assets still sync | `worker.syncTreasury` per-asset isolation |
+| A Safe x402 payment retried after a crash | The authorization's nonce comes from the intent, so a retry re-sends the same authorization; the token's `authorizationState` makes a second settlement impossible | `packages/x402-adapter` (`buildEip3009Authorization`), exercised by the Safe x402 suites |
 | Duplicate submission of the same request | The original intent is returned; no second payment | `apps/api/src/app.test.ts` idempotency |
 | Approval replayed or applied to a changed intent | Refused on the version and evidence hashes | `apps/api/src/app.test.ts`, `governance.test.ts` |
 

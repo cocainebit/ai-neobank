@@ -5,7 +5,7 @@ import type { PaymentPayload, PaymentRequired, PaymentRequirements, SettleRespon
 import { ExactEvmScheme as ExactEvmClientScheme } from "@x402/evm/exact/client";
 import { ExactSvmScheme as ExactSvmClientScheme } from "@x402/svm/exact/client";
 import { createKeyPairSignerFromBytes } from "@solana/kit";
-import { createPublicClient, http, parseAbiItem, type Address, type Hex, type LocalAccount } from "viem";
+import { createPublicClient, getAddress, hashTypedData, http, keccak256, parseAbiItem, stringToHex, type Address, type Hex, type LocalAccount } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { Connection, PublicKey } from "@solana/web3.js";
 import { getAssociatedTokenAddressSync } from "@solana/spl-token";
@@ -67,6 +67,80 @@ export interface X402PaymentResult {
 
 export class X402QuoteError extends Error {
   constructor(message: string, readonly code: "not_payable" | "no_acceptable_option" | "exceeds_max" | "unsupported_version") { super(message); this.name = "X402QuoteError"; }
+}
+
+export interface Eip3009Authorization {
+  from: string;
+  to: string;
+  value: string;
+  validAfter: string;
+  validBefore: string;
+  nonce: string;
+}
+
+export const eip3009Types = {
+  TransferWithAuthorization: [
+    { name: "from", type: "address" },
+    { name: "to", type: "address" },
+    { name: "value", type: "uint256" },
+    { name: "validAfter", type: "uint256" },
+    { name: "validBefore", type: "uint256" },
+    { name: "nonce", type: "bytes32" }
+  ]
+} as const;
+
+/**
+ * A payer that cannot sign for itself (a Safe) needs the authorization fixed
+ * before anyone approves it, so the nonce is derived from the intent: one intent
+ * can only ever authorise one payment, and a retry re-sends the same one.
+ */
+export function buildEip3009Authorization(quote: X402Quote, input: { from: string; intentId: string; validUntil: Date }): Eip3009Authorization {
+  return {
+    from: getAddress(input.from),
+    to: getAddress(quote.requirements.payTo),
+    value: quote.requirements.amount,
+    validAfter: "0",
+    validBefore: Math.floor(input.validUntil.getTime() / 1000).toString(),
+    nonce: keccak256(stringToHex(`relay-x402:${input.intentId}`))
+  };
+}
+
+/** The EIP-712 payload the token verifies, in the token's own domain. */
+export function eip3009TypedData(quote: X402Quote, authorization: Eip3009Authorization, chainId: number) {
+  const extra = quote.requirements.extra as { name?: string; version?: string } | undefined;
+  if (!extra?.name || !extra.version) throw new Error(`Quote for ${quote.requirements.asset} has no EIP-712 domain (name, version)`);
+  return {
+    domain: { name: extra.name, version: extra.version, chainId, verifyingContract: getAddress(quote.requirements.asset) },
+    types: eip3009Types,
+    primaryType: "TransferWithAuthorization" as const,
+    message: {
+      from: getAddress(authorization.from),
+      to: getAddress(authorization.to),
+      value: BigInt(authorization.value),
+      validAfter: BigInt(authorization.validAfter),
+      validBefore: BigInt(authorization.validBefore),
+      nonce: authorization.nonce as Hex
+    }
+  };
+}
+
+/** The digest of that payload: what a Safe is asked to vouch for through ERC-1271. */
+export function eip3009Digest(quote: X402Quote, authorization: Eip3009Authorization, chainId: number): Hex {
+  return hashTypedData(eip3009TypedData(quote, authorization, chainId));
+}
+
+/**
+ * An exact-scheme payload built from an authorization someone else signed. The
+ * signature may be longer than 65 bytes: a contract payer is verified through
+ * ERC-1271 and settled with the token's bytes-signature entry point.
+ */
+export function eip3009Payload(quote: X402Quote, authorization: Eip3009Authorization, signature: string): PaymentPayload {
+  return {
+    x402Version: quote.x402Version,
+    resource: quote.resource,
+    accepted: quote.requirements,
+    payload: { authorization, signature }
+  };
 }
 
 const transferEvent = parseAbiItem("event Transfer(address indexed from, address indexed to, uint256 value)");

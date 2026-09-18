@@ -4,7 +4,10 @@ import { createPublicClient, createWalletClient, defineChain, http, parseEther, 
 import { Connection, Keypair, LAMPORTS_PER_SOL, PublicKey, VersionedTransaction } from "@solana/web3.js";
 import { createPostgresJobQueue, createPostgresStore } from "@ai-neobank/database";
 import { createWorker } from "@ai-neobank/worker";
-import { deploySafeProtocolFixture, type SafeContractAddresses } from "@ai-neobank/safe-adapter";
+import { deploySafeProtocolFixture, SafeGovernanceAdapter, type SafeContractAddresses } from "@ai-neobank/safe-adapter";
+import { createLocalFacilitator, startLocalSeller } from "@ai-neobank/x402-adapter/testing";
+import { tokenAssetId } from "@ai-neobank/domain";
+import { readFileSync } from "node:fs";
 import { SquadsGovernanceAdapter } from "@ai-neobank/squads-adapter";
 import { SolanaAdapter } from "@ai-neobank/solana-adapter";
 import { signSolanaMessage } from "@ai-neobank/auth";
@@ -136,6 +139,70 @@ describe("governed treasuries over HTTP", () => {
     expect(done.execution.status).toBe("finalized");
     const balances = (await app!.inject({ method: "GET", url: `/v1/treasuries/${treasuryId}/balances`, headers: bearer(token) })).json().data.balances as { assetId: string; balanceBaseUnits: string }[];
     expect(BigInt(balances.find((entry) => entry.assetId === nativeAsset)!.balanceBaseUnits)).toBe(parseEther("2"));
+  }, 180_000);
+
+  testIf("Safe x402: owners sign a Safe message for the payment authorization and the facilitator settles it", async () => {
+    const fixture = JSON.parse(readFileSync(new URL("../../../packages/evm-adapter/fixtures/TestUSD3009.json", import.meta.url), "utf8")) as { abi: readonly unknown[]; bytecode: Hex };
+    const chain = defineChain({ id: 31337, name: "Anvil", nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 }, rpcUrls: { default: { http: [evmRpc!] } } });
+    const publicClient = createPublicClient({ chain, transport: http(evmRpc) });
+    const wallet = createWalletClient({ account: deployer, chain, transport: http(evmRpc) });
+    const ownerKey = generatePrivateKey();
+    const owner = privateKeyToAccount(ownerKey);
+    const facilitatorKey = generatePrivateKey();
+    await Promise.all([
+      anvil("anvil_setBalance", [owner.address, "0x56bc75e2d63100000"]),
+      anvil("anvil_setBalance", [privateKeyToAccount(facilitatorKey).address, "0x8ac7230489e80000"])
+    ]);
+    const session = await signInEvm(owner);
+    const token = session.session.token;
+
+    const safe = new SafeGovernanceAdapter({ rpcUrl: evmRpc!, chainId: 31337, contracts: contracts! });
+    const deployment = await safe.deploy(ownerKey, [owner.address], 1);
+    const erc20 = (await publicClient.waitForTransactionReceipt({ hash: await wallet.deployContract({ abi: fixture.abi as never, bytecode: fixture.bytecode, account: deployer }) })).contractAddress as Address;
+    await publicClient.waitForTransactionReceipt({ hash: await wallet.writeContract({ address: erc20, abi: fixture.abi as never, functionName: "mint", args: [deployment.address as Address, 2_000_000n], account: deployer }) });
+    const asset = (await app!.inject({ method: "POST", url: "/v1/assets", headers: bearer(token), payload: { network: evmNetwork, kind: "erc20", address: erc20, symbol: "TUSD" } })).json().data as { id: string };
+    expect(asset.id.toLowerCase()).toBe(tokenAssetId(evmNetwork, "erc20", erc20).toLowerCase());
+
+    const executor = (await app!.inject({ method: "POST", url: "/v1/signers", headers: bearer(token), payload: { chainFamily: "evm" } })).json().data as { id: string };
+    const registered = await app!.inject({ method: "POST", url: "/v1/treasuries", headers: bearer(token), payload: { name: "Ops Safe", chainFamily: "evm", network: evmNetwork, address: deployment.address, governance: "safe", executorSignerId: executor.id } });
+    expect(registered.statusCode).toBe(201);
+    const treasuryId = registered.json().data.id as string;
+
+    const payee = privateKeyToAccount(generatePrivateKey()).address;
+    const facilitator = await createLocalFacilitator({ evm: { rpcUrl: evmRpc!, chainId: 31337, privateKey: facilitatorKey } });
+    const seller = await startLocalSeller(facilitator.client, [
+      { route: "GET /report", network: evmNetwork, payTo: payee, asset: erc20, amount: "250000", extra: { name: "Test USD", version: "2" }, body: { report: "quarterly" } }
+    ], { evm: { rpcUrl: evmRpc! } });
+    try {
+      const agent = (await app!.inject({ method: "POST", url: "/v1/agents", headers: bearer(token), payload: { displayName: "Research", purpose: "Buy reports" } })).json().data as { id: string };
+      const agentToken = (await app!.inject({ method: "POST", url: `/v1/agents/${agent.id}/credentials`, headers: bearer(token), payload: {} })).json().token as string;
+      const policy = (await app!.inject({ method: "POST", url: "/v1/policies", headers: bearer(token), payload: { name: "Machine payments", definition: { maxPerTransactionBaseUnits: "1000000", maxDailyBaseUnits: "5000000", allowedNetworks: [evmNetwork], allowedAssets: [asset.id], allowedKinds: ["x402"] } } })).json().data as { id: string };
+      await app!.inject({ method: "POST", url: `/v1/policies/${policy.id}/bindings`, headers: bearer(token), payload: { agentId: agent.id } });
+
+      const submitted = await app!.inject({ method: "POST", url: "/v1/agent/intents", headers: bearer(agentToken), payload: { idempotencyKey: `safe-x402-${crypto.randomUUID()}`, kind: "x402", treasuryAccountId: treasuryId, assetId: asset.id, amountBaseUnits: "1000000", destination: `${seller.url}/report`, purpose: "Quarterly report" } });
+      expect(submitted.statusCode).toBe(202);
+      const intentId = submitted.json().data.id as string;
+      const pending = await untilStatus(token, intentId, ["approval_required", "rejected", "failed"]);
+      expect(pending.intent.status).toBe("approval_required");
+      expect(pending.approval.externalRef.kind).toBe("safe_x402");
+
+      const messageResponse = await app!.inject({ method: "GET", url: `/v1/intents/${intentId}/approval-message/approved`, headers: bearer(token) });
+      const { kind, typedData, expectedIntentVersion, compiledHash, simulationHash } = messageResponse.json().data as { kind: string; typedData: { types: Record<string, unknown>; domain: Record<string, unknown>; primaryType: string; message: { message: string } }; expectedIntentVersion: number; compiledHash: string; simulationHash: string };
+      expect(kind).toBe("eip712");
+      expect(typedData.primaryType).toBe("SafeMessage");
+      const { EIP712Domain: _domainType, ...types } = typedData.types;
+      const typed = { ...typedData, types } as never;
+      const wrongSigner = await privateKeyToAccount(generatePrivateKey()).signTypedData(typed);
+      expect((await app!.inject({ method: "POST", url: `/v1/intents/${intentId}/approve`, headers: bearer(token), payload: { expectedIntentVersion, compiledHash, simulationHash, signature: wrongSigner } })).statusCode).toBe(401);
+      const signature = await owner.signTypedData(typed);
+      expect((await app!.inject({ method: "POST", url: `/v1/intents/${intentId}/approve`, headers: bearer(token), payload: { expectedIntentVersion, compiledHash, simulationHash, signature } })).statusCode).toBe(202);
+
+      const done = await untilStatus(token, intentId, ["reconciled", "failed"]);
+      expect(done.intent.status).toBe("reconciled");
+      expect(await publicClient.readContract({ address: erc20, abi: [{ type: "function", name: "balanceOf", stateMutability: "view", inputs: [{ name: "account", type: "address" }], outputs: [{ type: "uint256" }] }] as const, functionName: "balanceOf", args: [payee] })).toBe(250_000n);
+    } finally {
+      await seller.close();
+    }
   }, 180_000);
 
   testIf("Squads: the member creates the multisig from the prepared transaction, registers, votes on chain through the API", async () => {

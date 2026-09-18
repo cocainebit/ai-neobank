@@ -83,13 +83,18 @@ function PolicyEditor({ policy, onClose }: { policy: Policy | null; onClose(): v
   const assets = useAssets();
   const { busy, run } = useAction();
   const initial = policy?.latest.definition;
-  const initialAsset = assetMeta(assets.byId, initial?.allowedAssets[0] ?? "");
   const [name, setName] = useState(policy?.name ?? "");
   const [selected, setSelected] = useState<string[]>(initial?.allowedAssets ?? []);
-  const toDecimal = (value: string | undefined) => value && initialAsset.decimals ? formatUnits(value, initialAsset.decimals) : "";
-  const [perPayment, setPerPayment] = useState(toDecimal(initial?.maxPerTransactionBaseUnits));
-  const [perDay, setPerDay] = useState(toDecimal(initial?.maxDailyBaseUnits));
-  const [autoUpTo, setAutoUpTo] = useState(initial && !initial.humanApprovalRequired ? toDecimal(initial.autoApproveUpToBaseUnits) : "0");
+  // The asset registry may still be loading, so existing amounts are formatted when
+  // it arrives rather than captured empty in a state initializer.
+  const initialDecimals = assets.byId.get(initial?.allowedAssets[0] ?? "")?.decimals;
+  const existing = (value: string | undefined) => value !== undefined && initialDecimals !== undefined ? formatUnits(value, initialDecimals) : "";
+  const [perPaymentInput, setPerPayment] = useState<string | null>(null);
+  const [perDayInput, setPerDay] = useState<string | null>(null);
+  const [autoUpToInput, setAutoUpTo] = useState<string | null>(null);
+  const perPayment = perPaymentInput ?? existing(initial?.maxPerTransactionBaseUnits);
+  const perDay = perDayInput ?? existing(initial?.maxDailyBaseUnits);
+  const autoUpTo = autoUpToInput ?? (initial && !initial.humanApprovalRequired ? existing(initial.autoApproveUpToBaseUnits) : "0");
   const [humanAlways, setHumanAlways] = useState(initial?.humanApprovalRequired ?? true);
   const [minApprovals, setMinApprovals] = useState(initial?.minApprovals ?? 1);
   const [requireBeneficiary, setRequireBeneficiary] = useState(initial?.requireBeneficiary ?? false);

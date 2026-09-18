@@ -15,9 +15,9 @@ import {
 import type { ResolvedAsset, SignedTransaction, TransferRequest } from "@ai-neobank/chain-core";
 import { EvmAdapter } from "@ai-neobank/evm-adapter";
 import { SolanaAdapter } from "@ai-neobank/solana-adapter";
-import { SafeGovernanceAdapter, recoverSafeSigner, type CompiledSafeTransaction, type SafeContractAddresses } from "@ai-neobank/safe-adapter";
+import { SafeGovernanceAdapter, encodeSafeOwnerSignatures, recoverSafeMessageSigner, recoverSafeSigner, safeMessageHash, type CompiledSafeTransaction, type SafeContractAddresses } from "@ai-neobank/safe-adapter";
 import { SquadsGovernanceAdapter } from "@ai-neobank/squads-adapter";
-import { X402PaymentClient, X402QuoteError, solanaWireNetwork, type PaymentPayload, type X402Quote } from "@ai-neobank/x402-adapter";
+import { X402PaymentClient, X402QuoteError, buildEip3009Authorization, eip3009Digest, eip3009Payload, solanaWireNetwork, type Eip3009Authorization, type PaymentPayload, type X402Quote } from "@ai-neobank/x402-adapter";
 import { LocalKeyring, kmsEvmAccount, openSecret, rewrapSecret, type KeyEncryptionProvider, type KmsClient } from "@ai-neobank/signer";
 import type { SignerKeyMaterial } from "@ai-neobank/database";
 import { Keypair, PublicKey } from "@solana/web3.js";
@@ -313,6 +313,34 @@ export class DurableWorker {
       throw error;
     }
     const amount = BigInt(context.amountBaseUnits);
+    if (context.governance === "safe" && context.kind === "x402") {
+      // A Safe cannot sign an EIP-3009 authorization itself. Its owners vouch for
+      // the authorization's digest with a Safe message, which the token checks
+      // through ERC-1271 at settlement. Nothing is broadcast here.
+      const stored = context.x402 as (X402Quote & { quotedAt?: string }) | null;
+      if (!stored?.requirements || !stored.paymentRequired || !stored.resource) { await this.queue.markFailed(intentId, "Intent has no x402 quote"); return; }
+      const quote: X402Quote = { url: stored.url, method: stored.method, x402Version: stored.x402Version, requirements: stored.requirements, resource: stored.resource, paymentRequired: stored.paymentRequired };
+      const chainId = this.chainConfig?.evm?.chainId;
+      if (!chainId) { await this.queue.markFailed(intentId, "EVM chain is not configured"); return; }
+      const observed = await this.safe(context.network).observe(context.from);
+      // The authorization has to outlive the people approving it.
+      const validUntil = new Date(Math.max(Date.parse(context.expiresAt) + 15 * 60_000, Date.now() + 30 * 60_000));
+      let authorization: Eip3009Authorization;
+      let digest: string;
+      try {
+        authorization = buildEip3009Authorization(quote, { from: context.from, intentId, validUntil });
+        digest = eip3009Digest(quote, authorization, chainId);
+      } catch (error) {
+        await this.queue.markFailed(intentId, error instanceof Error ? error.message : "Could not build the x402 authorization");
+        return;
+      }
+      await this.queue.completePublication(intentId, {
+        compiledHash: X402PaymentClient.quoteHash(quote),
+        requiredApprovals: Math.max(context.minApprovals, observed.threshold),
+        externalRef: { kind: "safe_x402", safeAddress: context.from, chainId, threshold: observed.threshold, owners: observed.owners, authorization, digest, safeMessageHash: safeMessageHash(chainId, context.from, digest) }
+      });
+      return;
+    }
     if (context.governance === "safe") {
       const safe = this.safe(context.network);
       const [compiled, observed] = await Promise.all([safe.compileTransfer(context.from, safeAsset(context.asset), context.to, amount), safe.observe(context.from)]);
@@ -504,6 +532,15 @@ export class DurableWorker {
       const balance = await adapter.getBalance(context.from, resolvedAsset(context.asset));
       if (balance < price) return { failure: `Insufficient token balance for the quoted price: ${balance} < ${price}` };
     }
+    // A Safe pays with an authorization its owners signed: assemble their signatures
+    // into the Safe's own ERC-1271 signature instead of signing with a Relay key.
+    const safeRef = context.governance === "safe" ? context.externalRef as { kind?: string; safeAddress?: string; chainId?: number; threshold?: number; owners?: string[]; authorization?: Eip3009Authorization; digest?: string; safeMessageHash?: string } | null : null;
+    if (context.governance === "safe") {
+      if (!safeRef?.authorization || !safeRef.safeMessageHash || !safeRef.owners) return { failure: "Safe x402 authorization is missing from the approval request" };
+      const chainId = this.chainConfig?.evm?.chainId;
+      if (!chainId || safeRef.chainId !== chainId) return { failure: "Approval was prepared for a different chain" };
+      if (eip3009Digest(quote, safeRef.authorization, chainId) !== safeRef.digest) return { failure: "The quote no longer matches the authorization the owners signed" };
+    }
     const settlementOf = (transactionHash: string, observed: Record<string, unknown>): Settlement => ({ transactionHash, payTo: quote.requirements.payTo, amountBaseUnits: quote.requirements.amount, observed });
     const lookup = async (): Promise<Settlement | null> => {
       const found = context.chainFamily === "evm"
@@ -516,6 +553,18 @@ export class DurableWorker {
       compiledPayload: { kind: "x402_exact", network: context.network, url: quote.url, method: quote.method, payTo: quote.requirements.payTo, settledAmountBaseUnits: quote.requirements.amount, assetId: context.assetId, wireNetwork: quote.requirements.network },
       compiledHash: context.approvalCompiledHash,
       sign: async (keys) => {
+        if (safeRef?.authorization && safeRef.safeMessageHash && safeRef.owners) {
+          const owners = new Set(safeRef.owners.map((owner) => owner.toLowerCase()));
+          const collected: { owner: string; signature: string }[] = [];
+          for (const entry of context.ownerSignatures) {
+            const recovered = await recoverSafeMessageSigner(safeRef.safeMessageHash, entry.signedPayload).catch(() => null);
+            if (recovered && owners.has(recovered.toLowerCase()) && recovered.toLowerCase() === entry.signerAddress.toLowerCase()) collected.push({ owner: recovered, signature: entry.signedPayload });
+          }
+          const threshold = Number(safeRef.threshold ?? collected.length);
+          if (collected.length < threshold) throw new ExecutionRejected(`Only ${collected.length} of ${threshold} owner signatures are valid for this authorization`);
+          const payload = eip3009Payload(quote, safeRef.authorization, encodeSafeOwnerSignatures(collected.slice(0, threshold)));
+          return { hash: X402PaymentClient.payloadId(payload), raw: JSON.stringify(payload), nonce: safeRef.authorization.nonce, validUntil: safeRef.authorization.validBefore };
+        }
         const payload = await client.createPayload(quote, context.chainFamily === "evm" ? { evmAccount: keys.evm() } : { solanaSecretKey: keys.secret() });
         return { hash: X402PaymentClient.payloadId(payload), raw: JSON.stringify(payload), nonce: "", validUntil: "" };
       },

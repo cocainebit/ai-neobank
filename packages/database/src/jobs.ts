@@ -98,6 +98,9 @@ export interface PublishContext {
   executorSignerId: string;
   executorAddress: string;
   key: SignerKeyMaterial;
+  kind: "transfer" | "x402";
+  /** x402: the quote captured at intake, which the owners are about to authorise. */
+  x402: Record<string, unknown> | null;
   /** What a previous, possibly crashed, attempt recorded before broadcasting. */
   publication: Record<string, unknown> | null;
 }
@@ -384,7 +387,10 @@ export class PostgresJobQueue {
     if (!row.assetKind || row.assetDecimals === null) return `Unknown asset ${row.assetId}`;
     if (row.assetNetwork !== row.network) return "Asset does not belong to the intent network";
     if (row.kind === "x402") {
-      if (row.governance !== "direct") return "x402 payments are made from direct treasuries; governed treasuries are not supported for x402 yet";
+      // A Squads vault is a program address: it cannot produce the payer signature
+      // the exact scheme needs, and no amount of governance changes that.
+      if (row.governance === "squads") return "A Squads vault cannot sign an x402 payment; pay from a direct treasury or a Safe";
+      if (row.governance === "safe" && row.chainFamily !== "evm") return "Safe x402 payments are EVM only";
       if (row.assetKind === "native") return "x402 pays in tokens, not the native coin";
       if (!/^https?:\/\//.test(row.destination)) return "x402 destination must be an http(s) resource URL";
     }
@@ -440,7 +446,11 @@ export class PostgresJobQueue {
         const locked = await tx<{ status: string }[]>`select status from intents where id = ${intentId} for update`;
         if (locked[0]?.status !== "received") return;
         const simulationHash = await this.hash(tx, ["simulation-v1", intentId, row.network, row.amountBaseUnits, row.destination, evidence.feeBaseUnits, evidence.sourceBalanceBaseUnits]);
-        await tx`update intents set policy_version_id = ${policyResult?.versionId ?? null}, policy_decision = ${tx.json({ outcome: "approval_required", reasons: [...decision.reasons, row.governance === "safe" ? "Safe treasury: owners approve on chain" : "Squads vault: voting members approve on chain"], spentTodayBaseUnits: spent, simulation: evidence, simulationHash, minApprovals: requiredApprovals } as never)} where id = ${intentId}`;
+        const { quote, ...simulation } = evidence;
+        const governanceReason = row.kind === "x402"
+          ? "Safe treasury: owners authorise the payment with their signatures"
+          : row.governance === "safe" ? "Safe treasury: owners approve on chain" : "Squads vault: voting members approve on chain";
+        await tx`update intents set policy_version_id = ${policyResult?.versionId ?? null}, policy_decision = ${tx.json({ outcome: "approval_required", reasons: [...decision.reasons, governanceReason], spentTodayBaseUnits: spent, simulation, ...(quote ? { x402: quote } : {}), simulationHash, minApprovals: requiredApprovals } as never)} where id = ${intentId}`;
         await this.transition(tx, intentId, row.organizationId, row.version, "received", "policy_evaluated", "intent.policy_evaluated", { governance: row.governance, requiredApprovals });
         await tx`
           insert into outbox_events (organization_id, topic, aggregate_type, aggregate_id, payload)
@@ -523,6 +533,7 @@ export class PostgresJobQueue {
       from: row.from, to: row.destination, asset: { id: row.assetId, kind: row.assetKind!, address: row.assetAddress, decimals: row.assetDecimals! }, amountBaseUnits: row.amountBaseUnits,
       expiresAt: row.expiresAt, minApprovals, treasuryConfiguration: row.observedConfiguration ?? {},
       executorSignerId: row.executorSignerId, executorAddress: row.signerAddress, key: publishKey,
+      kind: row.kind, x402: (row.policyDecision as { x402?: Record<string, unknown> } | null)?.x402 ?? null,
       publication: row.publication
     };
   }

@@ -47,7 +47,12 @@ export function IntentDrawer({ intentId, onClose }: { intentId: string; onClose(
   const reasons = intent.policyDecision?.reasons ?? [];
   const quote = intent.policyDecision?.x402;
   const hashLink = execution?.transactionHash ? explorerUrl(intent.network, execution.transactionHash) : null;
-  const walletAction = treasury?.governance === "squads" ? "Your wallet sends an on-chain vote." : treasury?.governance === "safe" ? "Your wallet signs the Safe transaction." : "Your wallet signs this decision.";
+  const walletAction = treasury?.governance === "squads"
+    ? "Your wallet sends an on-chain vote."
+    : treasury?.governance === "safe"
+      // A Safe cannot sign a machine payment itself; owners vouch for it with a Safe message.
+      ? intent.kind === "x402" ? "Your wallet signs the payment authorization for the Safe." : "Your wallet signs the Safe transaction."
+      : "Your wallet signs this decision.";
 
   const act = (decision: "approved" | "rejected") => run(decision, async () => {
     await decide(session, intentId, decision);

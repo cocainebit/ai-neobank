@@ -53,6 +53,17 @@ describe("PostgreSQL control plane", () => {
       await store.bindPolicy(owner.organizationId, { policyId: created.id, agentId: agent.id }, owner.principalId);
       expect((await store.listPolicies(owner.organizationId))[0]?.bindings[0]?.agentId).toBe(agent.id);
 
+      // A new version supersedes the old one and the binding follows it.
+      const tightened = await store.addPolicyVersion(owner.organizationId, created.id, policy({ maxPerTransactionBaseUnits: "500" }), owner.principalId);
+      expect(tightened?.latest.version).toBe(2);
+      expect(tightened?.latest.definition.maxPerTransactionBaseUnits).toBe("500");
+      expect(tightened?.bindings[0]?.agentId).toBe(agent.id);
+      const nearLimit = await intent(store, { organizationId: owner.organizationId, treasuryAccountId: treasury.id, requesterId: agent.principalId, amount: "900" });
+      await queue.evaluateIntent(nearLimit);
+      expect((await store.getIntent(owner.organizationId, nearLimit))?.intent.failureReason).toContain("Per-transaction limit");
+      // Back to the original cap for the rest of this run.
+      expect((await store.addPolicyVersion(owner.organizationId, created.id, policy(), owner.principalId))?.latest.version).toBe(3);
+
       // Per-transaction limit rejects at intake.
       const tooLarge = await intent(store, { organizationId: owner.organizationId, treasuryAccountId: treasury.id, requesterId: agent.principalId, amount: "2000" });
       await queue.evaluateIntent(tooLarge);

@@ -3,6 +3,7 @@ import { ApprovalError, type PostgresControlPlaneStore, type PostgresJobQueue, t
 import {
   asIntentStatus,
   asTimeLockChangeStatus,
+  describeIntentStatus,
   evaluateExecution,
   evaluateRejection,
   nextTimeLockChangeStatus,
@@ -407,7 +408,7 @@ export function registerGovernanceControlsRoutes(app: FastifyInstance, context: 
     const status = asIntentStatus(detail.intent.status);
     const execution = status
       ? evaluateExecution({ intentStatus: status, timeLock: lock })
-      : { allowed: false as const, code: "execution_not_approved" as const, message: `A payment is executed once it is approved; this one is ${detail.intent.status}.` };
+      : { allowed: false as const, code: "execution_not_approved" as const, message: `A payment is executed once it is approved. This one is ${describeIntentStatus(detail.intent.status)}.` };
     return { data: { intentId: detail.intent.id, status: detail.intent.status, source: reading.source, enforcedOnChain: reading.enforcedOnChain, note: reading.note, timeLock: lock, execution } };
   });
 

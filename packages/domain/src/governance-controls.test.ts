@@ -2,8 +2,10 @@ import { describe, expect, it } from "vitest";
 import {
   asIntentStatus,
   asTimeLockChangeStatus,
+  describeIntentStatus,
   evaluateExecution,
   evaluateRejection,
+  intentStatuses,
   nextTimeLockChangeStatus,
   readTimeLock,
   rejectionTransition,
@@ -107,6 +109,26 @@ describe("execution against a time lock", () => {
   it("lets an execution already under way through so a retry is not blocked", () => {
     const decision = evaluateExecution({ intentStatus: "executing", timeLock: timeLockState({ reading, approvedAt: "2026-09-21T10:00:00.000Z", now }) });
     expect(decision.allowed).toBe(true);
+  });
+
+  // The refusal is shown to a person, and it used to interpolate the raw status
+  // into the sentence: "this one is approval_required". That reads as a bug to
+  // whoever is shown it.
+  it("refuses in words, never by printing the status code", () => {
+    const decision = evaluateExecution({ intentStatus: "approval_required", timeLock: timeLockState({ reading, approvedAt: null, now }) });
+    const message = "message" in decision ? decision.message : "";
+    expect(message).toContain("waiting for an approval");
+    expect(message).not.toContain("approval_required");
+    expect(message).not.toMatch(/[a-z]_[a-z]/);
+  });
+
+  it("has a phrase for every status, so a new one cannot fall back to its own name", () => {
+    for (const status of intentStatuses) {
+      const phrase = describeIntentStatus(status);
+      expect(phrase.length).toBeGreaterThan(2);
+      expect(phrase).not.toContain("_");
+    }
+    expect(describeIntentStatus("something_else")).toBe("in a state this build does not recognise");
   });
 });
 

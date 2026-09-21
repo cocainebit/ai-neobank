@@ -128,9 +128,35 @@ export interface ExecutionAllowed {
  * the same rule on chain; this is what Relay shows and refuses on beforehand, so
  * an early attempt is a clear answer instead of a failed transaction.
  */
+/**
+ * What each status is, in words a person reads. The status itself is a code,
+ * and a code interpolated into a sentence reads as a bug to whoever is shown
+ * it. Every status has a phrase here, so a new one cannot quietly fall back to
+ * its own name.
+ */
+export const intentStatusPhrases: Record<IntentStatus, string> = {
+  received: "waiting for policy to look at it",
+  policy_evaluated: "waiting for a decision",
+  rejected: "rejected",
+  approval_required: "waiting for an approval",
+  auto_authorized: "authorised by policy and not yet approved",
+  approved: "approved",
+  executing: "being executed",
+  submitted: "already sent, waiting for the chain",
+  finalized: "already settled",
+  reconciled: "already settled and reconciled",
+  failed: "failed",
+  expired: "expired"
+};
+
+/** Takes a plain string too, because a row read from the database is one. */
+export function describeIntentStatus(status: IntentStatus | string): string {
+  return intentStatusPhrases[status as IntentStatus] ?? "in a state this build does not recognise";
+}
+
 export function evaluateExecution(input: { intentStatus: IntentStatus; timeLock: TimeLockState }): ExecutionAllowed | ControlRefusal {
   if (input.intentStatus !== "approved" && input.intentStatus !== "executing") {
-    return refuse("execution_not_approved", `A payment is executed once it is approved; this one is ${input.intentStatus}.`);
+    return refuse("execution_not_approved", `A payment is executed once it is approved. This one is ${describeIntentStatus(input.intentStatus)}.`);
   }
   if (input.timeLock.locked) {
     return refuse("time_locked", `The treasury's time lock holds this payment until ${input.timeLock.executableAt}, ${input.timeLock.remainingSeconds} seconds from now.`);

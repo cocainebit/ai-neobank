@@ -943,3 +943,151 @@ export { OperationsStore, OperationsError, type BeneficiaryRecord, type Schedule
 export { postLedger, ledgerNet, type LedgerLine, type LedgerAccountCode } from "./ledger.js";
 
 export { RotationStore, type ExecutorRotationRecord, type RotationContext } from "./rotations.js";
+
+// Verification cases: the application an owner fills in and signs.
+
+/** A wallet already bound to a principal, in the shape the attestation check needs. */
+export interface BoundWalletRecord {
+  id: string;
+  chainFamily: "evm" | "svm";
+  address: string;
+}
+
+/**
+ * What the owner signed when they sent the application for review. The exact
+ * statement is kept beside the signature so the record can be re-checked later
+ * without rebuilding it from a profile that may since have moved on.
+ */
+export interface VerificationSubmissionRecord {
+  submittedAt: string;
+  submittedBy: string;
+  attestationAddress: string;
+  attestationChainFamily: "evm" | "svm";
+  statement: string;
+  signature: string;
+}
+
+/**
+ * The application row. The profile is the draft as it was written through the
+ * profile schema; it holds entity facts and nothing else, and this store never
+ * looks inside it.
+ */
+export interface VerificationCaseRecord {
+  organizationId: string;
+  profile: Record<string, unknown> | null;
+  submission: VerificationSubmissionRecord | null;
+  updatedAt: string;
+}
+
+interface VerificationCaseRow {
+  organizationId: string;
+  profile: Record<string, unknown> | null;
+  statement: string | null;
+  signature: string | null;
+  attestationAddress: string | null;
+  attestationChainFamily: "evm" | "svm" | null;
+  submittedAt: string | null;
+  submittedBy: string | null;
+  updatedAt: string;
+}
+
+const verificationCaseColumns = `organization_id::text as "organizationId", profile,
+  attestation_statement as "statement", attestation_signature as "signature", attestation_address as "attestationAddress",
+  attestation_chain_family as "attestationChainFamily",
+  to_char(submitted_at at time zone 'utc', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as "submittedAt", submitted_by::text as "submittedBy",
+  to_char(updated_at at time zone 'utc', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as "updatedAt"`;
+
+function verificationCase(row: VerificationCaseRow | undefined): VerificationCaseRecord | null {
+  if (!row) return null;
+  const submission = row.submittedAt && row.submittedBy && row.statement && row.signature && row.attestationAddress && row.attestationChainFamily
+    ? {
+        submittedAt: row.submittedAt,
+        submittedBy: row.submittedBy,
+        attestationAddress: row.attestationAddress,
+        attestationChainFamily: row.attestationChainFamily,
+        statement: row.statement,
+        signature: row.signature
+      }
+    : null;
+  return { organizationId: row.organizationId, profile: row.profile, submission, updatedAt: row.updatedAt };
+}
+
+/**
+ * Reads and writes verification_cases: the entity profile an owner drafted and
+ * the attestation they signed over it.
+ *
+ * Nothing here decides anything and nothing here checks an identity, because
+ * there is no provider to check one with. Every method takes the database to
+ * run on, so a write can join the transaction that moves the case's status and
+ * the two can never disagree.
+ */
+export class VerificationCaseStore {
+  constructor(readonly sql: Sql) {}
+
+  async read(organizationId: string, db: Db = this.sql): Promise<VerificationCaseRecord | null> {
+    const rows = await db.unsafe<VerificationCaseRow[]>(`select ${verificationCaseColumns} from verification_cases where organization_id = $1`, [organizationId]);
+    return verificationCase(rows[0]);
+  }
+
+  /** Saves the draft. The caller decides whether the case may still be edited; this only writes. */
+  async saveProfile(organizationId: string, profile: Record<string, unknown>, db: Db = this.sql): Promise<VerificationCaseRecord> {
+    // The draft goes in as the object it is. Handing the driver a JSON string
+    // instead stores a jsonb string, which is not a profile and which the table
+    // refuses.
+    await db`
+      insert into verification_cases (organization_id, profile) values (${organizationId}, ${db.json(profile as never)})
+      on conflict (organization_id) do update set profile = excluded.profile, updated_at = now()
+    `;
+    const record = await this.read(organizationId, db);
+    if (!record) throw new Error("Verification case upsert returned no row");
+    return record;
+  }
+
+  /**
+   * Stores the submission against an existing draft. Returns null when there is
+   * no row to submit, so the caller can refuse rather than invent one: a
+   * submission with no profile attests to nothing.
+   */
+  async recordSubmission(
+    organizationId: string,
+    input: { statement: string; signature: string; address: string; chainFamily: "evm" | "svm"; submittedBy: string },
+    db: Db = this.sql
+  ): Promise<VerificationCaseRecord | null> {
+    const rows = await db.unsafe<VerificationCaseRow[]>(
+      `update verification_cases set attestation_statement = $2, attestation_signature = $3, attestation_address = $4,
+         attestation_chain_family = $5, submitted_at = now(), submitted_by = $6, updated_at = now()
+       where organization_id = $1
+       returning ${verificationCaseColumns}`,
+      [organizationId, input.statement, input.signature, input.address, input.chainFamily, input.submittedBy]
+    );
+    return verificationCase(rows[0]);
+  }
+
+  /**
+   * Clears the submission and keeps the draft. A new case is a new attestation,
+   * so the old signature goes; retyping the same entity facts would only invite
+   * a typo, so they stay as a draft the owner can edit.
+   */
+  async clearSubmission(organizationId: string, db: Db = this.sql): Promise<void> {
+    await db`
+      update verification_cases set attestation_statement = null, attestation_signature = null, attestation_address = null,
+        attestation_chain_family = null, submitted_at = null, submitted_by = null, updated_at = now()
+      where organization_id = ${organizationId} and submitted_at is not null
+    `;
+  }
+
+  /** The wallets bound to one principal. The attestation must come from one of these. */
+  async walletsForPrincipal(organizationId: string, principalId: string, db: Db = this.sql): Promise<BoundWalletRecord[]> {
+    return db.unsafe<BoundWalletRecord[]>(
+      `select id::text, chain_family as "chainFamily", address from human_wallets where organization_id = $1 and principal_id = $2 order by created_at`,
+      [organizationId, principalId]
+    );
+  }
+}
+
+/**
+ * The pool, or a transaction on it. A store method takes one of these so its
+ * write can join a transaction the caller has already opened, which is how a
+ * verification submission and the status move it causes stay one write.
+ */
+export type SqlRunner = Db;

@@ -147,7 +147,7 @@ function CardsTab({ cards, gate, locked }: { cards: CardsState; gate: Capability
         <header className="panel-head"><div><h2>What happens when cards open</h2><p>Nothing below is live yet. It is how a card here is meant to work, so the lock makes sense.</p></div></header>
         <div className="panel-body">
           <ol className="steps">
-            <li><b>Verify the business</b><span>A regulated partner has to know who you are before anyone holds a card. Relay has no verification provider connected yet.</span></li>
+            <li><b>Verify the business</b><span>A regulated partner has to know who you are before anyone holds a card. The verification in this console is not that check: it is a decision a person here recorded. Relay has no verification provider connected yet.</span></li>
             <li><b>Pick the treasury it spends from</b><span>A card does not hold a balance of its own. It draws on a vault or account you already control.</span></li>
             <li><b>Pick the holder and the limit</b><span>A person, or an agent. The limit is the policy already bound to them, not a second set of rules.</span></li>
             <li><b>Every authorisation becomes a payment</b><span>It shows in Payments, lands in Statements, and is reconciled against the chain like any other movement.</span></li>

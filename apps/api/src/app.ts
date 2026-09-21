@@ -5,6 +5,10 @@ import { ApprovalError, OperationsError, OperationsStore, RotationStore, type Po
 import type { FacilitatorClient } from "@x402/core/server";
 import { registerOperationsRoutes } from "./operations-routes.js";
 import { registerWalletRoutes } from "./wallet-routes.js";
+import { registerVerificationRoutes } from "./verification-routes.js";
+import { registerCardsRoutes } from "./cards-routes.js";
+import { registerVaultRoutes } from "./vault-routes.js";
+import { registerGovernanceControlsRoutes } from "./governance-controls-routes.js";
 import { paymentIntentSchema, policyDefinitionSchema, spendingPolicySchema, tokenAssetId, type PrincipalRole } from "@ai-neobank/domain";
 import { evaluatePaymentIntent } from "@ai-neobank/policy";
 import { LocalKeyring, evmAddressFromSpki, exportDevelopmentSecret, generateSigner, sealSecret, type KeyEncryptionProvider, type KmsClient } from "@ai-neobank/signer";
@@ -916,6 +920,14 @@ export function buildApp(options: AppOptions) {
   });
 
   registerOperationsRoutes(app, { options, store, operations, queue, human, adapters: { evm: evmAdapter, solana: solanaAdapter }, wireNetwork: async (family, network) => family === "evm" ? network : (options.chains?.solana?.x402Network ?? await solanaWireNetwork(network, options.chains?.solana?.rpcUrl ?? "")) });
+
+  registerVerificationRoutes(app, { store, human });
+
+  registerCardsRoutes(app, { store, human });
+
+  registerVaultRoutes(app, { store, human, safe: safeAdapter && options.chains?.evm ? { adapter: safeAdapter, network: options.chains.evm.network, chainId: options.chains.evm.chainId } : null, squads: squadsAdapter && solanaAdapter && options.chains?.solana ? { adapter: squadsAdapter, solana: solanaAdapter, network: options.chains.solana.network } : null });
+
+  registerGovernanceControlsRoutes(app, { options, store, queue, human, adapters: { evm: evmAdapter, solana: solanaAdapter, safe: safeAdapter, squads: squadsAdapter } });
 
   // Ledger, audit, operations
 

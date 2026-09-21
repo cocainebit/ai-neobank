@@ -14,7 +14,9 @@ const groups: { label: string; items: { href: string; label: string; icon: keyof
   { label: "Money", items: [
     { href: "/", label: "Overview", icon: "Overview" },
     { href: "/payments", label: "Payments", icon: "Payments", count: "approvals" },
+    { href: "/cards", label: "Cards", icon: "Card" },
     { href: "/treasuries", label: "Treasuries", icon: "Treasury" },
+    { href: "/vaults", label: "Vaults", icon: "Vault" },
     { href: "/invoices", label: "Invoices", icon: "Invoice" },
     { href: "/recurring", label: "Recurring", icon: "Recurring" },
     { href: "/statements", label: "Statements", icon: "Statement" }
@@ -28,7 +30,7 @@ const groups: { label: string; items: { href: string; label: string; icon: keyof
 ];
 
 const titles: Record<string, string> = {
-  "/": "Overview", "/payments": "Payments", "/treasuries": "Treasuries", "/invoices": "Invoices", "/recurring": "Recurring", "/statements": "Statements",
+  "/": "Overview", "/payments": "Payments", "/cards": "Cards", "/treasuries": "Treasuries", "/vaults": "Vaults", "/invoices": "Invoices", "/recurring": "Recurring", "/statements": "Statements",
   "/agents": "Agents", "/policies": "Policies", "/beneficiaries": "Beneficiaries", "/members": "Members", "/developers": "Developers", "/settings": "Settings"
 };
 

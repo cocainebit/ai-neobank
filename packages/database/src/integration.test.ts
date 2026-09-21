@@ -136,4 +136,31 @@ describe("PostgreSQL control plane", () => {
       await store.close();
     }
   }, 30_000);
+
+  testIf("lists a treasury's payments from the query, so a busy organisation's newest ones cannot hide them", async () => {
+    const store = createPostgresStore(databaseUrl!);
+    try {
+      const suffix = crypto.randomUUID().slice(0, 8);
+      const owner = await store.bootstrapOwner({ chainFamily: "evm", address: address(), displayName: "Owner", organizationName: "Listing", slug: `list-${suffix}` });
+      const agent = await store.createAgent(owner.organizationId, { displayName: "Payables", purpose: "Pay vendors" }, owner.principalId);
+      await store.ensureNativeAsset(network, "evm");
+      const vault = await store.createTreasury(owner.organizationId, { name: "Vault", chainFamily: "evm", network, address: address(), governance: "squads" }, owner.principalId);
+      const other = await store.createTreasury(owner.organizationId, { name: "Other", chainFamily: "evm", network, address: address(), governance: "direct" }, owner.principalId);
+
+      // One payment in flight on the vault, then newer ones on the other treasury.
+      const inFlight = await intent(store, { organizationId: owner.organizationId, treasuryAccountId: vault.id, requesterId: agent.principalId, amount: "100" });
+      for (let count = 0; count < 3; count += 1) await intent(store, { organizationId: owner.organizationId, treasuryAccountId: other.id, requesterId: agent.principalId, amount: "100" });
+
+      // A page of the organisation's newest payments no longer holds it: this is the route's 500 in miniature.
+      const newest = await store.listIntents(owner.organizationId, { status: "received", limit: 3 });
+      expect(newest).toHaveLength(3);
+      expect(newest.map((record) => record.id)).not.toContain(inFlight);
+      // Asked about the treasury, the query finds it whatever else the organisation has been doing.
+      expect((await store.listIntents(owner.organizationId, { status: "received", treasuryAccountId: vault.id, limit: 3 })).map((record) => record.id)).toEqual([inFlight]);
+      expect(await store.listIntents(owner.organizationId, { treasuryAccountId: other.id })).toHaveLength(3);
+      expect(await store.listIntents(owner.organizationId, { status: "approved", treasuryAccountId: vault.id })).toEqual([]);
+    } finally {
+      await store.close();
+    }
+  }, 30_000);
 });

@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import { Icons } from "../../../components/icons";
 import { useSession } from "../../../components/session";
 import { Ago, Empty, Field, LoadingRows, Modal, Notice, PageHead, Pill, Toggle, useAction } from "../../../components/ui";
+import { useVerification, VerificationPanel } from "../../../components/verification-banner";
 import { api, invalidate, useApi } from "../../../lib/api";
 import { useAssets, useNetworks, usePrincipalNames, useSigners, useTreasuries } from "../../../lib/data";
 import { networkLabel, sentence, shortAddress, type Tone } from "../../../lib/format";
@@ -29,6 +30,9 @@ export default function SettingsPage() {
   const signers = useSigners();
   const treasuries = useTreasuries();
   const names = usePrincipalNames();
+  // Verification is a state on the organization, so it is started and decided
+  // here. The locked features link back to this page for exactly that reason.
+  const verification = useVerification();
   const { busy, run } = useAction();
   const [name, setName] = useState(session.organization.name);
   const [confirmFreeze, setConfirmFreeze] = useState(false);
@@ -69,6 +73,8 @@ export default function SettingsPage() {
               </div>
             </div>
           </section>
+
+          <VerificationPanel verification={verification} />
 
           <section className="panel">
             <header className="panel-head"><div><h2>Activity log</h2><p>Append-only record of changes to money, people, keys, and rules</p></div></header>

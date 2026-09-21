@@ -267,4 +267,78 @@ describe("governed treasuries over HTTP", () => {
     expect(await connection.getBalance(new PublicKey(destination), "finalized")).toBe(1_000_000);
     void deployer;
   }, 240_000);
+
+  testIf("Squads: a payment's index is not a time lock change, on any vote branch, and a real change still votes", async () => {
+    const connection = new Connection(solanaRpc!, "confirmed");
+    const airdrop = async (address: PublicKey, sol: number) => {
+      const signature = await connection.requestAirdrop(address, sol * LAMPORTS_PER_SOL);
+      await connection.confirmTransaction({ signature, ...(await connection.getLatestBlockhash("confirmed")) }, "confirmed");
+    };
+    const owner = Keypair.generate();
+    const second = Keypair.generate();
+    await Promise.all([airdrop(owner.publicKey, 5), airdrop(second.publicKey, 2)]);
+    const session = await signInSolana(owner);
+    const token = session.session.token;
+    await app!.inject({ method: "POST", url: "/v1/members", headers: bearer(token), payload: { displayName: "Second member", role: "approver", wallet: { chainFamily: "svm", address: second.publicKey.toBase58() } } });
+
+    const executor = (await app!.inject({ method: "POST", url: "/v1/signers", headers: bearer(token), payload: { chainFamily: "svm" } })).json().data as { id: string; address: string };
+    const prepared = await app!.inject({ method: "POST", url: "/v1/treasuries/prepare", headers: bearer(token), payload: { governance: "squads", network: solNetwork, owners: [owner.publicKey.toBase58(), second.publicKey.toBase58()], threshold: 2, executorSignerId: executor.id } });
+    const creation = prepared.json().data as { multisigPda: string; vaultPda: string; transactionBase64: string };
+    const created = VersionedTransaction.deserialize(Buffer.from(creation.transactionBase64, "base64"));
+    created.sign([owner]);
+    const createdSignature = await connection.sendRawTransaction(created.serialize());
+    await connection.confirmTransaction({ signature: createdSignature, ...(await connection.getLatestBlockhash("confirmed")) }, "confirmed");
+    const registered = await app!.inject({ method: "POST", url: "/v1/treasuries", headers: bearer(token), payload: { name: "Vault", chainFamily: "svm", network: solNetwork, address: creation.vaultPda, governance: "squads", executorSignerId: executor.id, multisigPda: creation.multisigPda } });
+    expect(registered.statusCode).toBe(201);
+    const treasuryId = registered.json().data.id as string;
+
+    // A payment proposal on the same multisig, published the way Relay's executor publishes one.
+    const adapter = new SolanaAdapter({ rpcUrl: solanaRpc!, network: solNetwork, finality: "confirmed" });
+    const squads = new SquadsGovernanceAdapter(adapter);
+    const paymentIndex = (await squads.observe(creation.multisigPda)).transactionIndex + 1n;
+    const payment = await squads.prepareProposal(creation.multisigPda, owner.publicKey, paymentIndex, Keypair.generate().publicKey.toBase58(), { kind: "native" }, 1_000_000n, "vendor payment");
+    const publishedPayment = await adapter.signInstructions(payment.instructions, owner);
+    await adapter.broadcast(publishedPayment);
+    await squads.waitFor(publishedPayment.hash);
+    expect((await squads.observeProposal(creation.multisigPda, paymentIndex))?.status).toBe("active");
+
+    // Every branch refuses it. An approve vote here would approve the payment itself, outside every check the
+    // approval path makes; a cancel would leave Relay showing approved while the chain says cancelled.
+    for (const decision of ["approved", "rejected", "cancelled"]) {
+      const vote = await app!.inject({ method: "GET", url: `/v1/treasuries/${treasuryId}/time-lock/changes/${paymentIndex}/vote/${decision}`, headers: bearer(token) });
+      expect(vote.statusCode).toBe(404);
+      expect(vote.json()).toMatchObject({ error: "time_lock_change_not_found" });
+      expect(vote.json().data).toBeUndefined();
+    }
+    // It is not shown as a governance change either.
+    expect((await app!.inject({ method: "GET", url: `/v1/treasuries/${treasuryId}/time-lock/changes/${paymentIndex}`, headers: bearer(token) })).statusCode).toBe(404);
+
+    // Once the members approve the payment, the cancel branch is the dangerous one, and it is refused too.
+    await squads.vote(creation.multisigPda, paymentIndex, owner, "approved");
+    await squads.vote(creation.multisigPda, paymentIndex, second, "approved");
+    expect((await squads.observeProposal(creation.multisigPda, paymentIndex))?.status).toBe("approved");
+    const cancel = await app!.inject({ method: "GET", url: `/v1/treasuries/${treasuryId}/time-lock/changes/${paymentIndex}/vote/cancelled`, headers: bearer(token) });
+    expect(cancel.statusCode).toBe(404);
+    expect(cancel.json().error).toBe("time_lock_change_not_found");
+
+    // A config transaction at the next index is a time lock change, and it votes.
+    const change = await app!.inject({ method: "POST", url: `/v1/treasuries/${treasuryId}/time-lock`, headers: bearer(token), payload: { seconds: 3600 } });
+    expect(change.statusCode).toBe(201);
+    const changeIndex = change.json().data.transactionIndex as string;
+    expect(BigInt(changeIndex)).toBe(paymentIndex + 1n);
+    const publish = VersionedTransaction.deserialize(Buffer.from(change.json().data.transactionBase64 as string, "base64"));
+    publish.sign([owner]);
+    const changeSignature = await connection.sendRawTransaction(publish.serialize());
+    await connection.confirmTransaction({ signature: changeSignature, ...(await connection.getLatestBlockhash("confirmed")) }, "confirmed");
+
+    const shown = await app!.inject({ method: "GET", url: `/v1/treasuries/${treasuryId}/time-lock/changes/${changeIndex}`, headers: bearer(token) });
+    expect(shown.statusCode).toBe(200);
+    expect(shown.json().data).toMatchObject({ status: "active", transactionIndex: changeIndex, requiredApprovals: 2 });
+    for (const decision of ["approved", "rejected"]) {
+      const vote = await app!.inject({ method: "GET", url: `/v1/treasuries/${treasuryId}/time-lock/changes/${changeIndex}/vote/${decision}`, headers: bearer(token) });
+      expect(vote.statusCode).toBe(200);
+      expect(vote.json().data).toMatchObject({ decision, member: owner.publicKey.toBase58(), transactionIndex: changeIndex });
+      expect((vote.json().data.transactionBase64 as string).length).toBeGreaterThan(0);
+    }
+  }, 240_000);
 });

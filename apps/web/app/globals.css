@@ -309,3 +309,35 @@ table.data tbody tr.clickable:hover { background: var(--panel-2); }
 .steps b { font-weight: 550; }
 .steps span { color: var(--faint); font-size: 13px; }
 .steps a { color: var(--text); text-decoration: underline; text-underline-offset: 2px; }
+
+/* Vaults and cards */
+.wizard { display: flex; gap: 6px; margin: 0 0 18px; padding: 0; list-style: none; flex-wrap: wrap; }
+.wizard li { display: flex; align-items: center; gap: 8px; padding: 6px 12px 6px 6px; border-radius: 999px; border: 1px solid var(--line-soft); color: var(--faint); font-size: 12.5px; font-weight: 550; }
+.wizard li > span { width: 20px; height: 20px; border-radius: 50%; display: grid; place-items: center; background: var(--panel-3); color: var(--dim); font-size: 11px; }
+.wizard li > span svg { width: 12px; height: 12px; }
+.wizard li[aria-current="step"] { border-color: var(--line-strong); color: var(--text); }
+.wizard li[aria-current="step"] > span { background: var(--button); color: var(--button-text); }
+.wizard li.done { color: var(--dim); }
+.wizard li.done > span { background: var(--positive-soft); color: var(--positive); }
+
+.lock-state { display: grid; grid-template-columns: 10px minmax(0, 1fr); gap: 12px; align-items: start; }
+.lock-state > div { display: grid; gap: 4px; min-width: 0; }
+.lock-state b { font-weight: 600; }
+.lock-state span { font-size: 13px; line-height: 1.5; }
+.lock-dot { width: 8px; height: 8px; margin-top: 7px; border-radius: 50%; background: var(--faint); }
+.lock-dot.positive { background: var(--positive); }
+.lock-dot.pending { background: var(--pending); }
+.lock-dot.negative { background: var(--negative); }
+
+.fact-list { margin: 0; padding: 0; list-style: none; display: grid; gap: 10px; font-size: 13.5px; color: var(--dim); }
+.fact-list li { display: grid; grid-template-columns: 14px minmax(0, 1fr); gap: 10px; line-height: 1.5; }
+.fact-list li::before { content: ""; width: 5px; height: 5px; margin: 8px 0 0 4px; border-radius: 50%; background: var(--faint); }
+
+.fact-card { border: 1px solid var(--line-soft); border-radius: var(--radius-sm); padding: 14px 16px; background: var(--panel-2); }
+.fact-card b { display: block; font-weight: 600; margin-bottom: 6px; }
+.fact-card p { margin: 0; color: var(--dim); font-size: 13.5px; line-height: 1.55; }
+
+/* A card that does not exist is drawn as an outline, never as a number. */
+.card-face { height: 132px; max-width: 300px; border-radius: 14px; border: 1px dashed var(--line-strong); background: linear-gradient(140deg, var(--panel-2), var(--panel)); display: grid; place-items: center; align-content: center; gap: 10px; color: var(--faint); }
+.card-face-lock { width: 34px; height: 34px; border-radius: 10px; display: grid; place-items: center; background: var(--panel-3); border: 1px solid var(--line); }
+.card-face-text { font-size: 12.5px; font-weight: 550; letter-spacing: 0.02em; }

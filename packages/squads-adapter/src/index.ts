@@ -251,3 +251,79 @@ export class SquadsGovernanceAdapter {
 }
 
 export type { SignedTransaction };
+
+/** The multisig's derived accounts at one transaction index, without touching the network. */
+export function squadsRefFor(multisigPda: string, transactionIndex: bigint, programId: PublicKey = multisig.PROGRAM_ID): SquadsRef {
+  const pda = new PublicKey(multisigPda);
+  return {
+    multisigPda,
+    vaultPda: multisig.getVaultPda({ multisigPda: pda, index: 0, programId })[0].toBase58(),
+    transactionIndex: transactionIndex.toString(),
+    transactionPda: multisig.getTransactionPda({ multisigPda: pda, index: transactionIndex, programId })[0].toBase58(),
+    proposalPda: multisig.getProposalPda({ multisigPda: pda, transactionIndex, programId })[0].toBase58()
+  };
+}
+
+/**
+ * A config transaction and proposal that changes the multisig's time lock, built
+ * for a voting member's own wallet. Relay sets `configAuthority` to null when it
+ * creates a vault, so this is the only way the lock can move, and it moves only
+ * with the same threshold of owners a payment needs. The executor never creates
+ * or votes on it.
+ */
+export function prepareSquadsTimeLockChange(multisigPda: string, creator: string, transactionIndex: bigint, newTimeLock: number, memo: string, programId: PublicKey = multisig.PROGRAM_ID): { instructions: TransactionInstruction[]; ref: SquadsRef } {
+  if (!Number.isInteger(newTimeLock) || newTimeLock < 0 || newTimeLock > 90 * 24 * 60 * 60) throw new Error("Time lock must be a whole number of seconds between 0 and three months");
+  const pda = new PublicKey(multisigPda);
+  const member = new PublicKey(creator);
+  const ref = squadsRefFor(multisigPda, transactionIndex, programId);
+  const actions: multisig.types.ConfigAction[] = [{ __kind: "SetTimeLock", newTimeLock }];
+  const create = multisig.instructions.configTransactionCreate({ multisigPda: pda, transactionIndex, creator: member, actions, memo, programId });
+  const propose = multisig.instructions.proposalCreate({ multisigPda: pda, creator: member, transactionIndex, programId });
+  return { instructions: [create, propose], ref };
+}
+
+/**
+ * Cancels a proposal the members already approved but nobody has executed. A
+ * cancellation needs the same threshold of members as the approval did, so one
+ * member's signature only registers a cancel vote.
+ */
+export function squadsProposalCancelInstruction(multisigPda: string, transactionIndex: bigint, member: string, memo?: string, programId: PublicKey = multisig.PROGRAM_ID): TransactionInstruction {
+  return multisig.instructions.proposalCancel({ multisigPda: new PublicKey(multisigPda), transactionIndex, member: new PublicKey(member), ...(memo ? { memo } : {}), programId });
+}
+
+/**
+ * The proposal's status and the moment it entered it. A Squads time lock runs
+ * from the timestamp on the `Approved` status, so this is what says when an
+ * approved proposal becomes executable.
+ */
+export async function observeSquadsProposalTiming(connection: Connection, multisigPda: string, transactionIndex: bigint, programId: PublicKey = multisig.PROGRAM_ID): Promise<{ proposalPda: string; status: SquadsProposalObservation["status"]; statusAt: string | null } | null> {
+  const ref = squadsRefFor(multisigPda, transactionIndex, programId);
+  const info = await connection.getAccountInfo(new PublicKey(ref.proposalPda), "confirmed");
+  if (!info) return null;
+  const [proposal] = multisig.accounts.Proposal.fromAccountInfo(info);
+  const status = proposal.status;
+  const seconds = "timestamp" in status ? Number(status.timestamp.toString()) : null;
+  return {
+    proposalPda: ref.proposalPda,
+    status: status.__kind.toLowerCase() as SquadsProposalObservation["status"],
+    statusAt: seconds !== null && Number.isFinite(seconds) ? new Date(seconds * 1000).toISOString() : null
+  };
+}
+
+/**
+ * Whether the transaction account at this index is a config transaction: a
+ * change to the multisig itself, and the only kind of transaction a governance
+ * vote belongs to. The executor publishes payments at indices on the same
+ * multisig, and a proposal account looks the same whatever it proposes, so a
+ * caller that means to vote on governance asks this before it reads the
+ * proposal. False covers an index that holds a payment, an index that holds
+ * nothing, and an account that belongs to another program.
+ */
+export async function isSquadsConfigTransaction(connection: Connection, multisigPda: string, transactionIndex: bigint, programId: PublicKey = multisig.PROGRAM_ID): Promise<boolean> {
+  const ref = squadsRefFor(multisigPda, transactionIndex, programId);
+  const info = await connection.getAccountInfo(new PublicKey(ref.transactionPda), "confirmed");
+  if (!info || !info.owner.equals(programId)) return false;
+  // The program writes the account kind into the first eight bytes; a vault transaction carries a different one.
+  const discriminator = Buffer.from(multisig.generated.configTransactionDiscriminator);
+  return info.data.length >= discriminator.length && info.data.subarray(0, discriminator.length).equals(discriminator);
+}

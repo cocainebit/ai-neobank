@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { Connection, Keypair, LAMPORTS_PER_SOL, PublicKey, SystemProgram } from "@solana/web3.js";
 import { createMint, getOrCreateAssociatedTokenAccount, mintTo } from "@solana/spl-token";
 import { SolanaAdapter } from "@ai-neobank/solana-adapter";
-import { SquadsGovernanceAdapter } from "./index.js";
+import { isSquadsConfigTransaction, prepareSquadsTimeLockChange, SquadsGovernanceAdapter } from "./index.js";
 
 const rpcUrl = process.env.SOLANA_RPC_URL;
 const testIf = process.env.RUN_SQUADS_INTEGRATION === "1" && rpcUrl ? it : it.skip;
@@ -104,6 +104,19 @@ describe("Squads governance adapter", () => {
     await squads.waitFor(rejectPublished.hash);
     await squads.vote(created.multisigPda, rejectIndex, members[0]!, "rejected");
     expect((await squads.observeProposal(created.multisigPda, rejectIndex))?.status).toBe("rejected");
+
+    // A config change and a payment sit at indices on the same multisig, and only the account behind the index tells them apart.
+    const configIndex = rejectIndex + 1n;
+    const change = prepareSquadsTimeLockChange(created.multisigPda, members[0]!.publicKey.toBase58(), configIndex, 3600, "relay time lock");
+    const changePublished = await adapter.signInstructions(change.instructions, members[0]!);
+    await adapter.broadcast(changePublished);
+    await squads.waitFor(changePublished.hash);
+    expect(await isSquadsConfigTransaction(connection, created.multisigPda, configIndex)).toBe(true);
+    for (const paymentIndex of [index, splIndex, rejectIndex]) {
+      expect(await isSquadsConfigTransaction(connection, created.multisigPda, paymentIndex)).toBe(false);
+      expect((await squads.observeProposal(created.multisigPda, paymentIndex))).not.toBeNull();
+    }
+    expect(await isSquadsConfigTransaction(connection, created.multisigPda, configIndex + 1n)).toBe(false);
     void SystemProgram;
   }, 180_000);
 });

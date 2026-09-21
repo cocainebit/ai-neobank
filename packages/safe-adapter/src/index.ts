@@ -200,11 +200,25 @@ export class SafeGovernanceAdapter {
     return { provider: this.options.rpcUrl, ...extra, ...(this.networkConfig ? { contractNetworks: this.networkConfig } : {}) };
   }
 
-  /** Predicts the Safe address and returns the deployment transaction for any funded wallet to send. */
-  async prepareDeployment(owners: string[], threshold: number, saltNonce: string = randomSaltNonce()): Promise<{ address: string; to: string; data: string; value: string; saltNonce: string }> {
+  private async predictedKit(owners: string[], threshold: number, saltNonce: string) {
     if (threshold < 1 || threshold > owners.length) throw new Error("Invalid Safe threshold");
     if (new Set(owners.map((owner) => owner.toLowerCase())).size !== owners.length) throw new Error("Safe owners must be unique");
-    const kit = await Safe.init(this.kitConfig({ predictedSafe: { safeAccountConfig: { owners, threshold }, safeDeploymentConfig: { saltNonce, safeVersion: "1.4.1" } } }) as never);
+    return Safe.init(this.kitConfig({ predictedSafe: { safeAccountConfig: { owners, threshold }, safeDeploymentConfig: { saltNonce, safeVersion: "1.4.1" } } }) as never);
+  }
+
+  /**
+   * The address these owners, this threshold and this salt produce, whether or
+   * not the Safe exists yet. Building the deployment transaction is refused once
+   * the Safe is deployed, so a caller checking a Safe that is already on chain
+   * against the plan that predicted it asks for the address on its own.
+   */
+  async predictAddress(owners: string[], threshold: number, saltNonce: string): Promise<string> {
+    return (await this.predictedKit(owners, threshold, saltNonce)).getAddress();
+  }
+
+  /** Predicts the Safe address and returns the deployment transaction for any funded wallet to send. */
+  async prepareDeployment(owners: string[], threshold: number, saltNonce: string = randomSaltNonce()): Promise<{ address: string; to: string; data: string; value: string; saltNonce: string }> {
+    const kit = await this.predictedKit(owners, threshold, saltNonce);
     const deployment = await kit.createSafeDeploymentTransaction();
     return { address: await kit.getAddress(), to: deployment.to, data: deployment.data, value: deployment.value, saltNonce };
   }
@@ -288,4 +302,39 @@ export class SafeGovernanceAdapter {
     const result = await kit.executeTransaction(transaction);
     return { transactionHash: result.hash };
   }
+}
+
+const zeroAddress = "0x0000000000000000000000000000000000000000";
+
+/** The digest the owners sign, and the hash the Safe checks their signatures against. */
+export function safeTransactionHash(chainId: number, safeAddress: string, compiled: CompiledSafeTransaction): Hex {
+  return hashTypedData(safeTypedData(chainId, safeAddress, compiled));
+}
+
+/**
+ * A Safe's own way to cancel a queued transaction: a zero value call from the
+ * Safe to itself at the same nonce. Executing it consumes that nonce, so the
+ * payment it replaces can never be executed afterwards. Nothing else moves, and
+ * the hash is derived from the fields alone, so it can be built and checked
+ * without a node.
+ */
+export function compileSafeRejection(chainId: number, safeAddress: string, nonce: number): CompiledSafeTransaction {
+  if (!Number.isInteger(nonce) || nonce < 0) throw new Error("Safe nonce must be a non-negative integer");
+  const address = getAddress(safeAddress);
+  const fields = { to: address, value: "0", data: "0x", operation: 0, safeTxGas: "0", baseGas: "0", gasPrice: "0", gasToken: zeroAddress, refundReceiver: zeroAddress, nonce, safeTxHash: "" };
+  return { ...fields, safeTxHash: safeTransactionHash(chainId, address, fields) };
+}
+
+/**
+ * Whether a compiled rejection cancels exactly this transaction. Same Safe, same
+ * nonce, and nothing of its own to send: anything else would burn an unrelated
+ * nonce or move funds.
+ */
+export function safeRejectionCancels(rejection: CompiledSafeTransaction, target: CompiledSafeTransaction, safeAddress: string): boolean {
+  const address = getAddress(safeAddress).toLowerCase();
+  return rejection.nonce === target.nonce
+    && rejection.to.toLowerCase() === address
+    && BigInt(rejection.value) === 0n
+    && (rejection.data === "0x" || rejection.data === "")
+    && rejection.operation === 0;
 }

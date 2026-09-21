@@ -782,10 +782,12 @@ export class PostgresControlPlaneStore {
     });
   }
 
-  listIntents(organizationId: string, filter: { status?: string; requesterId?: string; limit?: number } = {}): Promise<IntentRecord[]> {
+  /** The treasury filter is a filter on the query, not on the page: a caller asking about one treasury must not lose its payments behind the organisation's newest ones. */
+  listIntents(organizationId: string, filter: { status?: string; requesterId?: string; treasuryAccountId?: string; limit?: number } = {}): Promise<IntentRecord[]> {
     return this.sql.unsafe<IntentRecord[]>(
-      `select ${intentColumns} from intents where organization_id = $1 and ($2::text is null or status = $2) and ($3::uuid is null or requester_principal_id = $3) order by created_at desc limit $4`,
-      [organizationId, filter.status ?? null, filter.requesterId ?? null, filter.limit ?? 200]
+      `select ${intentColumns} from intents where organization_id = $1 and ($2::text is null or status = $2) and ($3::uuid is null or requester_principal_id = $3)
+         and ($4::uuid is null or treasury_account_id = $4) order by created_at desc limit $5`,
+      [organizationId, filter.status ?? null, filter.requesterId ?? null, filter.treasuryAccountId ?? null, filter.limit ?? 200]
     );
   }
 

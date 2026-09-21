@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { intentStatuses, type IntentStatus } from "./index.js";
+import { intentStatuses, type IntentStatus } from "./primitives.js";
 
 /**
  * Time locks and rejections as pure decisions. Nothing here reads a chain or a

@@ -1,5 +1,5 @@
 import { z } from "zod";
-import type { PrincipalRole } from "./index.js";
+import type { PrincipalRole } from "./primitives.js";
 
 /**
  * Verification (KYB) of the organisation behind a Relay account.

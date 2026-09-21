@@ -1,9 +1,11 @@
 import { z } from "zod";
 
-export const chainFamilySchema = z.enum(["evm", "svm"]);
-export type ChainFamily = z.infer<typeof chainFamilySchema>;
+import { chainFamilySchema, networkSchema, type ChainFamily, type IntentStatus, type PrincipalRole } from "./primitives.js";
 
-export const networkSchema = z.string().regex(/^[a-z0-9]+:[a-zA-Z0-9-]+$/, "Use a CAIP-2 network identifier");
+// The shared schemas live in primitives.js, which is re-exported here so every
+// importer still reads them from @ai-neobank/domain. See that file for why.
+export * from "./primitives.js";
+export type { ChainFamily, IntentStatus, PrincipalRole } from "./primitives.js";
 
 export const treasuryAccountSchema = z.object({
   id: z.string().min(1),
@@ -69,24 +71,6 @@ export type PolicyDecision =
   | { outcome: "approval_required"; reasons: string[] }
   | { outcome: "auto_authorized"; reasons: string[] };
 
-export const intentStatuses = [
-  "received",
-  "policy_evaluated",
-  "rejected",
-  "approval_required",
-  "auto_authorized",
-  "approved",
-  "executing",
-  "submitted",
-  "finalized",
-  "reconciled",
-  "failed",
-  "expired"
-] as const;
-export type IntentStatus = (typeof intentStatuses)[number];
-
-export const principalRoles = ["owner", "approver", "operator", "auditor", "developer", "agent"] as const;
-export type PrincipalRole = (typeof principalRoles)[number];
 
 /** Native coin asset identifiers, SLIP-44 style, keyed by chain family. */
 export const nativeAssetIds: Record<ChainFamily, string> = { evm: "slip44:60", svm: "slip44:501" };

@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { networkSchema, type ChainFamily } from "./index.js";
+import { networkSchema, type ChainFamily } from "./primitives.js";
 
 /**
  * Vault creation rules, shared and pure. A vault is a treasury whose keys the

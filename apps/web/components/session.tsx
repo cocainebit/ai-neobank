@@ -3,7 +3,7 @@
 import { createContext, useCallback, useContext, useEffect, useState, type ReactNode } from "react";
 import { api, ApiError, invalidate } from "../lib/api";
 import type { Session } from "../lib/types";
-import { availableWallets, connectEvm, connectSolana, signEvmMessage, signSolanaMessage, type WalletSource } from "../lib/wallet";
+import { availableWallets, connectEvm, connectSolana, developmentWalletOffered, preferDevelopmentWallet, signEvmMessage, signSolanaMessage, type WalletSource } from "../lib/wallet";
 import { Icons } from "./icons";
 import { Notice } from "./ui";
 
@@ -117,6 +117,18 @@ function SignIn({ onSignedIn }: { onSignedIn(): Promise<void> }) {
             <span className="faint">{busy === "svm" ? "Waiting…" : <Icons.ChevronRight style={{ width: 18 }} />}</span>
           </button>
           {error && <Notice tone="negative">{error}</Notice>}
+          {developmentWalletOffered() && (
+            <div style={{ display: "grid", gap: 6 }}>
+              <p className="faint" style={{ fontSize: 12.5, margin: 0 }}>
+                An extension can put a wallet on the page and then never answer it, which leaves the buttons above waiting.
+                These sign with a key kept in this browser, against local chains only.
+              </p>
+              <div style={{ display: "flex", gap: 8 }}>
+                <button className="ghost" style={{ fontSize: 12.5 }} disabled={busy !== null} onClick={() => { preferDevelopmentWallet("evm"); void signIn("evm"); }}>Development Ethereum wallet</button>
+                <button className="ghost" style={{ fontSize: 12.5 }} disabled={busy !== null} onClick={() => { preferDevelopmentWallet("svm"); void signIn("svm"); }}>Development Solana wallet</button>
+              </div>
+            </div>
+          )}
           <p className="faint" style={{ fontSize: 12.5, margin: 0 }}>First time here? Signing in creates a workspace that your wallet owns. To join a team, ask an owner to add your wallet address, then sign in.</p>
         </div>
       </section>

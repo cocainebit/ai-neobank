@@ -96,13 +96,46 @@ export function availableWallets(): { evm: WalletSource | null; solana: WalletSo
   };
 }
 
+/**
+ * A development wallet the person picked on purpose, rather than one we fell
+ * back to. An extension can inject window.ethereum and then never answer
+ * eth_requestAccounts, and because that injection counts as a browser wallet
+ * the development wallet was never offered: sign-in simply waited forever. The
+ * choice lives in sessionStorage so it survives the reload sign-in does.
+ */
+const preferenceKey = "relay.devwallet.preferred";
+
+function preferred(): Record<ChainFamilyName, boolean> {
+  if (!devEnabled || typeof window === "undefined") return { evm: false, svm: false };
+  try {
+    const raw = window.sessionStorage.getItem(preferenceKey);
+    const parsed = raw ? (JSON.parse(raw) as Partial<Record<ChainFamilyName, boolean>>) : {};
+    return { evm: parsed.evm === true, svm: parsed.svm === true };
+  } catch {
+    return { evm: false, svm: false };
+  }
+}
+
+/** Switches this browser to the development wallet for one chain family, or back. */
+export function preferDevelopmentWallet(family: ChainFamilyName, on = true): void {
+  if (!devEnabled || typeof window === "undefined") return;
+  try { window.sessionStorage.setItem(preferenceKey, JSON.stringify({ ...preferred(), [family]: on })); } catch { /* a browser refusing storage keeps the injected wallet */ }
+}
+
+/** Whether a development wallet can be offered at all. False in any real deployment. */
+export function developmentWalletOffered(): boolean {
+  return devEnabled;
+}
+
 function evm(): EvmProvider {
+  if (devEnabled && preferred().evm) return devEvmProvider();
   if (window.ethereum) return window.ethereum;
   if (devEnabled) return devEvmProvider();
   throw new Error("No Ethereum wallet found. Install MetaMask, Rabby, or another EIP-1193 wallet.");
 }
 
 function solana(): SolanaProvider {
+  if (devEnabled && preferred().svm) return devSolanaProvider();
   const provider = window.phantom?.solana ?? window.solana;
   if (provider) return provider;
   if (devEnabled) return devSolanaProvider();
@@ -159,6 +192,7 @@ export async function signSolanaTransaction(transactionBase64: string): Promise<
 }
 
 export function isDevelopmentWallet(family: ChainFamilyName): boolean {
+  if (devEnabled && preferred()[family]) return true;
   const available = availableWallets();
   return (family === "evm" ? available.evm : available.solana) === "development";
 }
